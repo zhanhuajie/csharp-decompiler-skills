@@ -22,38 +22,51 @@
   ```bash
   dotnet tool install -g ilspycmd
   ```
+- **dotnet-script** 已安装（`csharp-definition-lookup` 所需）：
+  ```bash
+  dotnet tool install -g dotnet-script
+  ```
 - Python 3.x
 
 ### 安装验证
 
 ```bash
-python csharp-decompiler/scripts/decompile.py check
+dotnet --version
+ilspycmd --version
 ```
 
 ---
 
 ## csharp-decompiler
 
-将 .NET 程序集反编译为 C# 源码。
+直接使用 `ilspycmd` 将 .NET 程序集反编译为 C# 源码。
 
 ### 列出程序集内的所有类型
 
 ```bash
-python csharp-decompiler/scripts/decompile.py list <assembly_path>
+ilspycmd -l s <assembly_path>
 ```
 
 ### 反编译指定类型
 
+**Windows (PowerShell)：**
+```powershell
+ilspycmd -t <FullNamespace.ClassName> <assembly_path> 2>&1 > C:\temp\MyType.cs
+```
+
+**Linux/macOS：**
 ```bash
-python csharp-decompiler/scripts/decompile.py type <assembly_path> <FullNamespace.ClassName>
+ilspycmd -t <FullNamespace.ClassName> <assembly_path> > /tmp/MyType.cs 2>&1
 ```
 
 > 嵌套类使用 `+` 分隔符：`Namespace.OuterClass+InnerClass`
 
+> **注意**：`ilspycmd` 将输出写入 stderr，请务必使用文件重定向（`2>&1 >`）并通过读取输出文件获取内容——不要依赖终端直接输出。
+
 ### 导出完整项目
 
 ```bash
-python csharp-decompiler/scripts/decompile.py all <assembly_path> <output_directory>
+ilspycmd -p -o <output_directory> <assembly_path>
 ```
 
 ---
@@ -73,6 +86,21 @@ python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project 
 ```bash
 python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --list-refs
 ```
+
+### 获取简洁 API 摘要（推荐用于大型类型）
+
+```bash
+python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --summary
+```
+
+### 其他选项
+
+| 选项 | 说明 |
+|------|------|
+| `--summary` | 仅显示成员签名（不含方法体），适合初次了解大型或陌生类型。 |
+| `--full` | 输出完整反编译内容，取消默认的 60 行截断限制。 |
+| `--namespace <prefix>` | 按命名空间前缀过滤结果（例如 `Autodesk`）。 |
+| `--dll <path>` | 直接搜索指定 DLL，不从 `.csproj` 解析。 |
 
 > 使用前请先执行 `dotnet restore`，以生成 `obj/project.assets.json`。
 
@@ -97,8 +125,6 @@ csharp-decompiler           ──►  获得：完整 C# 源码 / 项目结构
 ```
 csharp-decompiler/
   SKILL.md               # 技能描述与用法（供 AI Agent 加载）
-  scripts/
-    decompile.py         # ilspycmd 封装脚本
 
 csharp-definition-lookup/
   SKILL.md               # 技能描述与用法（供 AI Agent 加载）

@@ -22,38 +22,51 @@ A collection of agent-agnostic AI skills for C# assembly decompilation and symbo
   ```bash
   dotnet tool install -g ilspycmd
   ```
+- **dotnet-script** installed (required for `csharp-definition-lookup`):
+  ```bash
+  dotnet tool install -g dotnet-script
+  ```
 - Python 3.x
 
 ### Verify Installation
 
 ```bash
-python csharp-decompiler/scripts/decompile.py check
+dotnet --version
+ilspycmd --version
 ```
 
 ---
 
 ## csharp-decompiler
 
-Decompile .NET assemblies to C# source code.
+Decompile .NET assemblies to C# source code using `ilspycmd` directly.
 
 ### List all types in an assembly
 
 ```bash
-python csharp-decompiler/scripts/decompile.py list <assembly_path>
+ilspycmd -l s <assembly_path>
 ```
 
 ### Decompile a specific type
 
+**Windows (PowerShell):**
+```powershell
+ilspycmd -t <FullNamespace.ClassName> <assembly_path> 2>&1 > C:\temp\MyType.cs
+```
+
+**Linux/macOS:**
 ```bash
-python csharp-decompiler/scripts/decompile.py type <assembly_path> <FullNamespace.ClassName>
+ilspycmd -t <FullNamespace.ClassName> <assembly_path> > /tmp/MyType.cs 2>&1
 ```
 
 > For nested classes, use `+` notation: `Namespace.OuterClass+InnerClass`
 
+> **Note**: `ilspycmd` writes to stderr. Always use file redirection (`2>&1 >`) and read the output file — do not rely on terminal output.
+
 ### Export the full project
 
 ```bash
-python csharp-decompiler/scripts/decompile.py all <assembly_path> <output_directory>
+ilspycmd -p -o <output_directory> <assembly_path>
 ```
 
 ---
@@ -73,6 +86,21 @@ python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project 
 ```bash
 python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --list-refs
 ```
+
+### Get a clean API summary (recommended for large types)
+
+```bash
+python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --summary
+```
+
+### Additional options
+
+| Option | Description |
+|--------|-------------|
+| `--summary` | Show only member signatures (no method bodies). Best first step for large or unfamiliar types. |
+| `--full` | Print full decompiled output without the default 60-line truncation limit. |
+| `--namespace <prefix>` | Filter results by namespace prefix (e.g., `Autodesk`). |
+| `--dll <path>` | Search a specific DLL directly instead of resolving from `.csproj`. |
 
 > Run `dotnet restore` first to generate `obj/project.assets.json` for NuGet resolution.
 
@@ -97,8 +125,6 @@ csharp-decompiler           ──►  Outputs: full C# source / project structu
 ```
 csharp-decompiler/
   SKILL.md               # Skill description and usage (loaded by AI agents)
-  scripts/
-    decompile.py         # ilspycmd wrapper script
 
 csharp-definition-lookup/
   SKILL.md               # Skill description and usage (loaded by AI agents)
