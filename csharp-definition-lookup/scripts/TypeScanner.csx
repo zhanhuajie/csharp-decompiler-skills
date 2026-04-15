@@ -214,10 +214,19 @@ if (!string.IsNullOrEmpty(dllArg))
 
 if (!string.IsNullOrEmpty(projectArg))
 {
-    var (_, assetDlls, groups) = ResolveFromAssets(projectArg);
+    var resolvedProjectPath = Path.GetFullPath(projectArg);
+    if (!File.Exists(resolvedProjectPath))
+    {
+        Console.Error.WriteLine($"Error: Project file not found: '{resolvedProjectPath}'.");
+        Console.Error.WriteLine("Tip: Relative paths are resolved from the script's working directory, not the caller's.");
+        Console.Error.WriteLine("     Use an absolute path for --project to avoid this issue.");
+        Console.Error.WriteLine($"     Example: --project \"{Path.GetFullPath(projectArg)}\"");
+        Environment.Exit(1);
+    }
+    var (_, assetDlls, groups) = ResolveFromAssets(resolvedProjectPath);
     assetGroups = groups;
     dllsToCheck.AddRange(assetDlls);
-    dllsToCheck.AddRange(GetCsprojHintPaths(projectArg));
+    dllsToCheck.AddRange(GetCsprojHintPaths(resolvedProjectPath));
 }
 
 // Deduplicate while preserving order
@@ -226,8 +235,11 @@ dllsToCheck = dllsToCheck.Where(d => seenPaths.Add(d)).ToList();
 
 if (!string.IsNullOrEmpty(projectArg) && dllsToCheck.Count == 0)
 {
-    Console.Error.WriteLine($"Warning: No DLL references found in project '{projectArg}'.");
-    Console.Error.WriteLine("If this is an SDK-style project, ensure you have run 'dotnet restore'.");
+    var resolved = Path.GetFullPath(projectArg);
+    Console.Error.WriteLine($"Warning: No DLL references found in project '{resolved}'.");
+    Console.Error.WriteLine("Possible causes:");
+    Console.Error.WriteLine("  1. Run 'dotnet restore' to generate obj/project.assets.json.");
+    Console.Error.WriteLine($"  2. Expected assets file: {Path.Combine(Path.GetDirectoryName(resolved), "obj", "project.assets.json")}");
     Environment.Exit(1);
 }
 

@@ -50,10 +50,20 @@ Once you have the full name and DLL path, use the `csharp-decompiler` skill to i
 
 - **Requires prerequisites**: `dotnet-script` must be installed globally (`dotnet tool install -g dotnet-script`). The tool fails completely if it is missing.
 - **Exact name match only**: The scanner matches on the simple type name (not the full namespace). If multiple types share the same name, all matches are returned — use `--namespace` to narrow results.
+- **Use absolute paths for `--project`**: `dotnet-script` resolves relative paths from the script file's directory (e.g., `scripts/`), not from the shell's working directory. Always pass an absolute path to avoid silent failures:
+
+  ```
+  # Wrong (relative path — fails if cwd != script dir)
+  --project MyProject.csproj
+
+  # Correct (absolute path — always works)
+  --project C:\repos\MyApp\MyProject.csproj
+  ```
 
 ## Common Mistakes
 
 - **Missing assets file**: Forgetting to run `dotnet restore` on a new project, which prevents the tool from finding NuGet dependencies.
+- **Relative path for `--project`**: Passing a relative path like `MyProject.csproj` silently fails because `dotnet-script` resolves it from the script's own directory. Always use an absolute path.
 - **Case Sensitivity**: While the tool tries to match symbols, it's best to use the exact casing of the class name.
 - **Wrong Project**: Providing a `.csproj` that doesn't reference the assembly you're interested in.
 
