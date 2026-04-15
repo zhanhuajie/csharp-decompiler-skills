@@ -26,7 +26,6 @@ A collection of agent-agnostic AI skills for C# assembly decompilation and symbo
   ```bash
   dotnet tool install -g dotnet-script
   ```
-- Python 3.x
 
 ### Verify Installation
 
@@ -39,7 +38,7 @@ ilspycmd --version
 
 ## csharp-decompiler
 
-Decompile .NET assemblies to C# source code using `ilspycmd` directly.
+Decompile .NET assemblies to C# source code using `ilspycmd`.
 
 ### List all types in an assembly
 
@@ -77,28 +76,20 @@ Locate a type's namespace and DLL path from project references (`.csproj` / NuGe
 
 ### Basic usage
 
-```bash
-python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj>
+```powershell
+dotnet script csharp-definition-lookup/scripts/TypeScanner.csx -- <SymbolName> --project <PathToCsproj>
 ```
 
 ### List all resolved references
 
-```bash
-python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --list-refs
-```
-
-### Get a clean API summary (recommended for large types)
-
-```bash
-python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --summary
+```powershell
+dotnet script csharp-definition-lookup/scripts/TypeScanner.csx -- <SymbolName> --project <PathToCsproj> --list-refs
 ```
 
 ### Additional options
 
 | Option | Description |
 |--------|-------------|
-| `--summary` | Show only member signatures (no method bodies). Best first step for large or unfamiliar types. |
-| `--full` | Print full decompiled output without the default 60-line truncation limit. |
 | `--namespace <prefix>` | Filter results by namespace prefix (e.g., `Autodesk`). |
 | `--dll <path>` | Search a specific DLL directly instead of resolving from `.csproj`. |
 
@@ -129,8 +120,7 @@ csharp-decompiler/
 csharp-definition-lookup/
   SKILL.md               # Skill description and usage (loaded by AI agents)
   scripts/
-    csharp_lookup.py     # Symbol lookup script
-    TypeScanner.csx      # C# Script helper scanner
+    TypeScanner.csx      # Complete lookup tool (resolves references + scans PE metadata)
 ```
 
 ---

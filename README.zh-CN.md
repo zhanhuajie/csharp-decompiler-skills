@@ -26,7 +26,6 @@
   ```bash
   dotnet tool install -g dotnet-script
   ```
-- Python 3.x
 
 ### 安装验证
 
@@ -39,7 +38,7 @@ ilspycmd --version
 
 ## csharp-decompiler
 
-直接使用 `ilspycmd` 将 .NET 程序集反编译为 C# 源码。
+使用 `ilspycmd` 将 .NET 程序集反编译为 C# 源码。
 
 ### 列出程序集内的所有类型
 
@@ -77,28 +76,20 @@ ilspycmd -p -o <output_directory> <assembly_path>
 
 ### 基本用法
 
-```bash
-python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj>
+```powershell
+dotnet script csharp-definition-lookup/scripts/TypeScanner.csx -- <SymbolName> --project <PathToCsproj>
 ```
 
 ### 列出所有已解析的引用
 
-```bash
-python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --list-refs
-```
-
-### 获取简洁 API 摘要（推荐用于大型类型）
-
-```bash
-python csharp-definition-lookup/scripts/csharp_lookup.py <SymbolName> --project <PathToCsproj> --summary
+```powershell
+dotnet script csharp-definition-lookup/scripts/TypeScanner.csx -- <SymbolName> --project <PathToCsproj> --list-refs
 ```
 
 ### 其他选项
 
 | 选项 | 说明 |
 |------|------|
-| `--summary` | 仅显示成员签名（不含方法体），适合初次了解大型或陌生类型。 |
-| `--full` | 输出完整反编译内容，取消默认的 60 行截断限制。 |
 | `--namespace <prefix>` | 按命名空间前缀过滤结果（例如 `Autodesk`）。 |
 | `--dll <path>` | 直接搜索指定 DLL，不从 `.csproj` 解析。 |
 
@@ -129,8 +120,7 @@ csharp-decompiler/
 csharp-definition-lookup/
   SKILL.md               # 技能描述与用法（供 AI Agent 加载）
   scripts/
-    csharp_lookup.py     # 符号查找脚本
-    TypeScanner.csx      # C# Script 辅助扫描器
+    TypeScanner.csx      # 完整查找工具（解析引用 + 扫描 PE 元数据）
 ```
 
 ---
