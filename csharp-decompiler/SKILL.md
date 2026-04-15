@@ -64,8 +64,8 @@ For large types with many members, get a quick overview of the public API withou
 **Windows (PowerShell):**
 
 ```powershell
-ilspycmd -t <full_type_name> <assembly_path> 2>&1 > C:\temp\out.cs
-Select-String -Path C:\temp\out.cs -Pattern '\b(public|protected|private|internal|static|override|virtual|abstract)\b' | Where-Object { $_.Line -notmatch '\{|//' } | Select-Object -ExpandProperty Line
+ilspycmd -t <full_type_name> <assembly_path> 2>&1 > "$env:TEMP\out.cs"
+Select-String -Path "$env:TEMP\out.cs" -Pattern '\b(public|protected|private|internal|static|override|virtual|abstract)\b' | Where-Object { $_.Line -notmatch '\{|//' } | Select-Object -ExpandProperty Line
 ```
 
 **Linux/macOS:**
@@ -84,7 +84,7 @@ Decompile and save a specific type to a file, then read it with the `read_file` 
 **Windows (PowerShell):**
 
 ```powershell
-ilspycmd -t <full_type_name> <assembly_path> 2>&1 > C:\temp\MyType.cs
+ilspycmd -t <full_type_name> <assembly_path> 2>&1 > "$env:TEMP\MyType.cs"
 ```
 
 **Linux/macOS:**
@@ -95,7 +95,7 @@ ilspycmd -t <full_type_name> <assembly_path> > /tmp/MyType.cs 2>&1
 
 Then use `read_file` on the output file to retrieve the content. Do not rely on terminal output — it will be truncated for non-trivial types.
 
-> **Note**: For nested classes, use the `+` notation: `ilspycmd -t "Namespace.OuterClass+InnerClass" my.dll 2>&1 > C:\temp\out.cs`
+> **Note**: For nested classes, use the `+` notation: `ilspycmd -t "Namespace.OuterClass+InnerClass" my.dll 2>&1 > "$env:TEMP\out.cs"`
 
 ### 5. Full Project Export
 
