@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>apilookup</AssemblyName>
+    <PackageId>ApiLookup</PackageId>
+    <RootNamespace>ApiLookup</RootNamespace>
+    <PackAsTool Condition="'$(PublishSingleFile)' != 'true'">true</PackAsTool>
+    <ToolCommandName>apilookup</ToolCommandName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.22" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ApiLookup.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -1,11 +1,13 @@
 ---
 name: csharp-decompiler
-description: Decompile .NET IL-based assemblies (.dll, .exe) to C# source code. Use when analyzing C# binaries, reverse engineering logic, or exporting complete projects from compiled files. Supports listing types, decompiling specific classes, and full project export. If you cannot confirm which DLL contains the target type, use the `csharp-definition-lookup` skill first to locate the exact assembly.
+description: Decompile .NET IL-based assemblies (.dll, .exe) to C# source code. Use when you need method bodies, internal logic, hidden side effects, or full project export from compiled files. For checking type locations, clean C# signatures, XML docs, inheritance, or extension methods, use the faster `csharp-definition-lookup` skill first.
 ---
 
 # C# Decompiler
 
 Expert tool for reverse engineering .NET assemblies using `ilspycmd`.
+
+> **Prefer `csharp-definition-lookup` first**: For locating DLLs/namespaces, inspecting public API signatures, XML documentation, inherited members, extension methods, or type hierarchies, use `csharp-definition-lookup` (`apilookup.exe`) first — it is instant and avoids C++/CLI IL noise. Use `csharp-decompiler` (`ilspycmd`) when you need actual **method bodies / internal implementation details** (and reuse the exact `CLR Name` + `Assembly` path printed by `apilookup show`).
 
 ## Prerequisites
 
@@ -23,7 +25,7 @@ If you need to find an assembly path manually, search these common locations:
 
 ## Workflow
 
-> **Note on Output Noise**: `ilspycmd` may print version warning lines such as `not using the latest version of the tool` or `Latest version is X.X.X`. These are harmless and can be ignored when parsing output.
+> **Note on Output Streams**: `ilspycmd` writes decompiled C# source to **stdout** and version/diagnostic notices (such as `not using the latest version of the tool`) to **stderr**. Do **not** merge `2>&1` into `.cs` files — in Windows PowerShell 5.1, `2>&1 >` encodes files as UTF-16 LE, injects `ErrorRecord` stack text into the source file, and throws a terminating error when `$ErrorActionPreference = "Stop"`. Pipe `stdout` with `Out-File -Encoding utf8` on Windows or redirect `2>/dev/null` on Linux/macOS.
 
 ### 1. Verify Environment
 
@@ -57,21 +59,19 @@ Use this name verbatim as `<full_type_name>` in subsequent commands. Nested clas
 
 ### 3. API Surface Overview (Signatures Only)
 
-For large types with many members, get a quick overview of the public API without reading the full implementation.
-
-> **Note**: `ilspycmd` writes to **stderr**, not stdout. Direct piping is unreliable across PowerShell versions. Always use file redirection.
+For large types with many members, prefer `apilookup show <TypeName> --dll <assembly_path>`. If using `ilspycmd` directly:
 
 **Windows (PowerShell):**
 
 ```powershell
-ilspycmd -t <full_type_name> <assembly_path> 2>&1 > "$env:TEMP\out.cs"
+ilspycmd -t <full_type_name> <assembly_path> | Out-File -FilePath "$env:TEMP\out.cs" -Encoding utf8
 Select-String -Path "$env:TEMP\out.cs" -Pattern '\b(public|protected|private|internal|static|override|virtual|abstract)\b' | Where-Object { $_.Line -notmatch '\{|//' } | Select-Object -ExpandProperty Line
 ```
 
 **Linux/macOS:**
 
 ```bash
-ilspycmd -t <full_type_name> <assembly_path> > /tmp/out.cs 2>&1
+ilspycmd -t <full_type_name> <assembly_path> > /tmp/out.cs 2>/dev/null
 grep -E '\b(public|protected|private|internal)\b' /tmp/out.cs | grep -v '{' | grep -v '//'
 ```
 
@@ -79,23 +79,23 @@ This extracts method/property/field declaration lines while skipping implementat
 
 ### 4. Decompile Specific Type
 
-Decompile and save a specific type to a file, then read it with the `read_file` tool:
+Decompile and save a specific type to a UTF-8 file, then read it with the `read_file` tool:
 
 **Windows (PowerShell):**
 
 ```powershell
-ilspycmd -t <full_type_name> <assembly_path> 2>&1 > "$env:TEMP\MyType.cs"
+ilspycmd -t <full_type_name> <assembly_path> | Out-File -FilePath "$env:TEMP\MyType.cs" -Encoding utf8
 ```
 
 **Linux/macOS:**
 
 ```bash
-ilspycmd -t <full_type_name> <assembly_path> > /tmp/MyType.cs 2>&1
+ilspycmd -t <full_type_name> <assembly_path> > /tmp/MyType.cs 2>/dev/null
 ```
 
 Then use `read_file` on the output file to retrieve the content. Do not rely on terminal output — it will be truncated for non-trivial types.
 
-> **Note**: For nested classes, use the `+` notation: `ilspycmd -t "Namespace.OuterClass+InnerClass" my.dll 2>&1 > "$env:TEMP\out.cs"`
+> **Note**: For nested classes, use the `+` notation: `ilspycmd -t "Namespace.OuterClass+InnerClass" my.dll | Out-File -FilePath "$env:TEMP\out.cs" -Encoding utf8`
 
 ### 5. Full Project Export
 
@@ -104,10 +104,10 @@ Decompile the entire assembly into a C# project structure (.csproj and .cs files
 
 ## Best Practices
 
-- **Narrow Search**: Use `-l s` first to confirm the exact type name before decompiling.
-- **Large Types**: For types with 50+ members, use the API Surface Overview step first to understand the structure before reading full source.
+- **Narrow Search**: Use `-l s` (or `apilookup locate`) first to confirm the exact type name before decompiling.
+- **Large Types**: For types with 50+ members, inspect signatures with `apilookup show --member <filter>` first before reading full decompiled source.
 - **Full Type Names**: Always include the namespace (e.g., `MyCompany.Services.AuthService`) for precise decompilation.
-- **Always Use File Redirection**: All `ilspycmd` commands write to stderr. Always redirect with `2>&1 >` (Windows) or `> file 2>&1` (Linux/macOS) and read the output file. Terminal output will be truncated or empty.
+- **Keep stdout Clean UTF-8**: Pipe `stdout` to `Out-File -Encoding utf8` (Windows) or `> file 2>/dev/null` (Linux/macOS) and read the output file.
 
 ## Troubleshooting & Advanced
 

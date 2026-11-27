@@ -1,0 +1,552 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading.Channels;
+using Microsoft.Data.Sqlite;
+
+namespace ApiLookup;
+
+public static class IndexBuilder
+{
+    public const string SchemaVersion = "4";
+
+    public static (IndexStore Store, IndexStats Stats) EnsureBuilt(
+        string dbPath,
+        string? indexName,
+        ResolvedSources sources,
+        string sourceDescription,
+        bool includeNonPublic,
+        bool forceRebuild,
+        List<string>? warnings = null)
+    {
+        var sw = Stopwatch.StartNew();
+        var dir = Path.GetDirectoryName(dbPath);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+
+        var effectiveFingerprint = $"{SchemaVersion}|{(includeNonPublic ? "all" : "pub")}|{sources.Fingerprint}";
+
+        if (!forceRebuild && TryOpenMatching(dbPath, effectiveFingerprint, out var fastStore))
+        {
+            var stats = fastStore!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds);
+            return (fastStore, stats);
+        }
+
+        using var buildLock = IndexCatalog.AcquireBuildLock(dbPath);
+
+        // Re-check after acquiring the cross-process lock in case another process just completed the build.
+        if (!forceRebuild && TryOpenMatching(dbPath, effectiveFingerprint, out var lockedFastStore))
+        {
+            var stats = lockedFastStore!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds);
+            return (lockedFastStore, stats);
+        }
+
+        var tempPath = dbPath + $".tmp-{Environment.ProcessId}-{Guid.NewGuid():N}";
+        try
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+
+            var channel = Channel.CreateBounded<ExtractedAssembly>(new BoundedChannelOptions(Math.Max(4, Environment.ProcessorCount * 2))
+            {
+                SingleWriter = false,
+                SingleReader = true,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+
+            var extractWarnings = new ConcurrentBag<string>();
+            var producerTask = Task.Run(async () =>
+            {
+                try
+                {
+                    await Parallel.ForEachAsync(sources.Assemblies, async (asm, ct) =>
+                    {
+                        var localWarnings = new List<string>();
+                        var extracted = MetadataExtractor.Extract(asm, includeNonPublic, localWarnings);
+                        foreach (var w in localWarnings)
+                            extractWarnings.Add(w);
+                        if (extracted != null)
+                            await channel.Writer.WriteAsync(extracted, ct).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+                    channel.Writer.Complete();
+                }
+                catch (Exception ex)
+                {
+                    channel.Writer.TryComplete(ex);
+                }
+            });
+
+            using (var conn = new SqliteConnection($"Data Source={tempPath};Mode=ReadWriteCreate;Pooling=False"))
+            {
+                conn.Open();
+                ExecuteNonQuery(conn, @"
+PRAGMA journal_mode = OFF;
+PRAGMA synchronous = OFF;
+PRAGMA temp_store = MEMORY;
+PRAGMA cache_size = -64000;
+");
+                CreateTables(conn);
+
+                using (var tx = conn.BeginTransaction())
+                {
+                    InsertFromChannel(conn, tx, channel.Reader, indexName, effectiveFingerprint, sourceDescription);
+                    producerTask.GetAwaiter().GetResult();
+                    tx.Commit();
+                }
+
+                CreateIndexes(conn);
+                ExecuteNonQuery(conn, @"
+INSERT INTO fts_entries(fts_entries) VALUES('optimize');
+ANALYZE;
+");
+            }
+
+            foreach (var w in extractWarnings)
+                warnings?.Add(w);
+
+            File.Move(tempPath, dbPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                try { File.Delete(tempPath); } catch { }
+            }
+        }
+
+        var store = IndexStore.OpenReadOnly(dbPath);
+        var builtStats = store.ReadStats(indexName, rebuilt: true, sw.ElapsedMilliseconds);
+        return (store, builtStats);
+    }
+
+    private static bool TryOpenMatching(string dbPath, string expectedFingerprint, out IndexStore? store)
+    {
+        store = null;
+        if (!File.Exists(dbPath)) return false;
+
+        try
+        {
+            var candidate = IndexStore.OpenReadOnly(dbPath);
+            if (candidate.GetMeta("fingerprint") == expectedFingerprint &&
+                candidate.GetMeta("schema_version") == SchemaVersion)
+            {
+                store = candidate;
+                return true;
+            }
+            candidate.Dispose();
+        }
+        catch
+        {
+            store?.Dispose();
+            store = null;
+        }
+        return false;
+    }
+
+    private static void CreateTables(SqliteConnection conn)
+    {
+        ExecuteNonQuery(conn, @"
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE assemblies (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL COLLATE NOCASE,
+    path TEXT NOT NULL,
+    version TEXT NOT NULL,
+    xml_path TEXT,
+    file_size INTEGER NOT NULL,
+    mtime_utc INTEGER NOT NULL,
+    type_count INTEGER NOT NULL
+);
+
+CREATE TABLE types (
+    id INTEGER PRIMARY KEY,
+    assembly_id INTEGER NOT NULL,
+    full_name TEXT NOT NULL COLLATE NOCASE,
+    bare_full_name TEXT NOT NULL COLLATE NOCASE,
+    clr_name TEXT NOT NULL COLLATE NOCASE,
+    namespace TEXT NOT NULL COLLATE NOCASE,
+    name TEXT NOT NULL COLLATE NOCASE,
+    simple_name TEXT NOT NULL COLLATE NOCASE,
+    kind TEXT NOT NULL COLLATE NOCASE,
+    accessibility TEXT NOT NULL,
+    modifiers TEXT NOT NULL,
+    base_type TEXT COLLATE NOCASE,
+    base_bare TEXT COLLATE NOCASE,
+    base_simple TEXT COLLATE NOCASE,
+    interfaces TEXT NOT NULL,
+    generic_params TEXT NOT NULL,
+    generic_constraints TEXT NOT NULL,
+    delegate_signature TEXT,
+    is_extension_container INTEGER NOT NULL,
+    summary TEXT,
+    remarks TEXT,
+    doc_id TEXT NOT NULL
+);
+
+CREATE TABLE type_interfaces (
+    type_id INTEGER NOT NULL,
+    iface_full TEXT NOT NULL COLLATE NOCASE,
+    iface_simple TEXT NOT NULL COLLATE NOCASE
+);
+
+CREATE TABLE members (
+    id INTEGER PRIMARY KEY,
+    type_id INTEGER NOT NULL,
+    assembly_id INTEGER NOT NULL,
+    kind TEXT NOT NULL COLLATE NOCASE,
+    name TEXT NOT NULL COLLATE NOCASE,
+    accessibility TEXT NOT NULL,
+    modifiers TEXT NOT NULL,
+    return_type TEXT NOT NULL,
+    return_simple TEXT NOT NULL COLLATE NOCASE,
+    signature TEXT NOT NULL,
+    param_types TEXT NOT NULL,
+    ext_target_type TEXT COLLATE NOCASE,
+    ext_target_simple TEXT COLLATE NOCASE,
+    enum_value TEXT,
+    summary TEXT,
+    params_doc TEXT,
+    returns_doc TEXT,
+    doc_id TEXT NOT NULL
+);
+
+CREATE TABLE extension_targets (
+    member_id INTEGER NOT NULL,
+    target_full TEXT NOT NULL COLLATE NOCASE,
+    target_simple TEXT NOT NULL COLLATE NOCASE
+);
+
+CREATE TABLE member_type_refs (
+    member_id INTEGER NOT NULL,
+    type_full TEXT NOT NULL COLLATE NOCASE,
+    type_simple TEXT NOT NULL COLLATE NOCASE,
+    role TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE fts_entries USING fts5(
+    entity_type UNINDEXED,
+    entity_id UNINDEXED,
+    kind UNINDEXED,
+    assembly_name UNINDEXED,
+    namespace UNINDEXED,
+    full_name,
+    name,
+    tokens,
+    summary,
+    tokenize = 'unicode61'
+);
+");
+    }
+
+    private static void CreateIndexes(SqliteConnection conn)
+    {
+        ExecuteNonQuery(conn, @"
+CREATE INDEX idx_types_full_name ON types(full_name);
+CREATE INDEX idx_types_bare_full_name ON types(bare_full_name);
+CREATE INDEX idx_types_clr_name ON types(clr_name);
+CREATE INDEX idx_types_simple_name ON types(simple_name);
+CREATE INDEX idx_types_name ON types(name);
+CREATE INDEX idx_types_base_type ON types(base_type);
+CREATE INDEX idx_types_base_bare ON types(base_bare);
+CREATE INDEX idx_types_base_simple ON types(base_simple);
+CREATE INDEX idx_types_namespace ON types(namespace);
+CREATE INDEX idx_types_assembly_id ON types(assembly_id);
+
+CREATE INDEX idx_type_interfaces_type_id ON type_interfaces(type_id);
+CREATE INDEX idx_type_interfaces_full ON type_interfaces(iface_full);
+CREATE INDEX idx_type_interfaces_simple ON type_interfaces(iface_simple);
+
+CREATE INDEX idx_members_type_id ON members(type_id);
+CREATE INDEX idx_members_name ON members(name);
+CREATE INDEX idx_members_ext_target ON members(ext_target_type);
+CREATE INDEX idx_members_ext_simple ON members(ext_target_simple);
+
+CREATE INDEX idx_extension_targets_lookup ON extension_targets(target_simple, target_full, member_id);
+CREATE INDEX idx_extension_targets_member ON extension_targets(member_id);
+
+CREATE INDEX idx_member_type_refs_lookup ON member_type_refs(type_simple, role, member_id);
+CREATE INDEX idx_member_type_refs_full ON member_type_refs(type_full, role, member_id);
+");
+    }
+
+    private static void InsertFromChannel(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        ChannelReader<ExtractedAssembly> reader,
+        string? indexName,
+        string fingerprint,
+        string sourceDescription)
+    {
+        using var metaCmd = conn.CreateCommand();
+        metaCmd.Transaction = tx;
+        metaCmd.CommandText = "INSERT INTO meta(key, value) VALUES($k, $v)";
+        var pMetaK = metaCmd.Parameters.Add("$k", SqliteType.Text);
+        var pMetaV = metaCmd.Parameters.Add("$v", SqliteType.Text);
+
+        void PutMeta(string k, string v)
+        {
+            pMetaK.Value = k;
+            pMetaV.Value = v;
+            metaCmd.ExecuteNonQuery();
+        }
+
+        PutMeta("schema_version", SchemaVersion);
+        PutMeta("fingerprint", fingerprint);
+        PutMeta("built_at_utc", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+        PutMeta("sources", sourceDescription);
+        if (!string.IsNullOrWhiteSpace(indexName))
+            PutMeta("index_name", indexName);
+
+        using var asmCmd = conn.CreateCommand();
+        asmCmd.Transaction = tx;
+        asmCmd.CommandText = @"
+INSERT INTO assemblies(id, name, path, version, xml_path, file_size, mtime_utc, type_count)
+VALUES($id, $name, $path, $version, $xml, $size, $mtime, $tcount);";
+        var pAsmId = asmCmd.Parameters.Add("$id", SqliteType.Integer);
+        var pAsmName = asmCmd.Parameters.Add("$name", SqliteType.Text);
+        var pAsmPath = asmCmd.Parameters.Add("$path", SqliteType.Text);
+        var pAsmVer = asmCmd.Parameters.Add("$version", SqliteType.Text);
+        var pAsmXml = asmCmd.Parameters.Add("$xml", SqliteType.Text);
+        var pAsmSize = asmCmd.Parameters.Add("$size", SqliteType.Integer);
+        var pAsmMtime = asmCmd.Parameters.Add("$mtime", SqliteType.Integer);
+        var pAsmTCount = asmCmd.Parameters.Add("$tcount", SqliteType.Integer);
+
+        using var typeCmd = conn.CreateCommand();
+        typeCmd.Transaction = tx;
+        typeCmd.CommandText = @"
+INSERT INTO types(id, assembly_id, full_name, bare_full_name, clr_name, namespace, name, simple_name, kind,
+                  accessibility, modifiers, base_type, base_bare, base_simple, interfaces, generic_params,
+                  generic_constraints, delegate_signature, is_extension_container, summary, remarks, doc_id)
+VALUES($id, $aid, $full, $bareFull, $clr, $ns, $name, $simple, $kind,
+       $acc, $mod, $base, $baseBare, $baseSimple, $ifaces, $gp,
+       $gcon, $dsig, $ext, $sum, $rem, $docId);";
+        var pTId = typeCmd.Parameters.Add("$id", SqliteType.Integer);
+        var pTAid = typeCmd.Parameters.Add("$aid", SqliteType.Integer);
+        var pTFull = typeCmd.Parameters.Add("$full", SqliteType.Text);
+        var pTBareFull = typeCmd.Parameters.Add("$bareFull", SqliteType.Text);
+        var pTClr = typeCmd.Parameters.Add("$clr", SqliteType.Text);
+        var pTNs = typeCmd.Parameters.Add("$ns", SqliteType.Text);
+        var pTName = typeCmd.Parameters.Add("$name", SqliteType.Text);
+        var pTSimple = typeCmd.Parameters.Add("$simple", SqliteType.Text);
+        var pTKind = typeCmd.Parameters.Add("$kind", SqliteType.Text);
+        var pTAcc = typeCmd.Parameters.Add("$acc", SqliteType.Text);
+        var pTMod = typeCmd.Parameters.Add("$mod", SqliteType.Text);
+        var pTBase = typeCmd.Parameters.Add("$base", SqliteType.Text);
+        var pTBaseBare = typeCmd.Parameters.Add("$baseBare", SqliteType.Text);
+        var pTBaseS = typeCmd.Parameters.Add("$baseSimple", SqliteType.Text);
+        var pTIfaces = typeCmd.Parameters.Add("$ifaces", SqliteType.Text);
+        var pTGp = typeCmd.Parameters.Add("$gp", SqliteType.Text);
+        var pTGcon = typeCmd.Parameters.Add("$gcon", SqliteType.Text);
+        var pTDsig = typeCmd.Parameters.Add("$dsig", SqliteType.Text);
+        var pTExt = typeCmd.Parameters.Add("$ext", SqliteType.Integer);
+        var pTSum = typeCmd.Parameters.Add("$sum", SqliteType.Text);
+        var pTRem = typeCmd.Parameters.Add("$rem", SqliteType.Text);
+        var pTDocId = typeCmd.Parameters.Add("$docId", SqliteType.Text);
+
+        using var ifaceCmd = conn.CreateCommand();
+        ifaceCmd.Transaction = tx;
+        ifaceCmd.CommandText = "INSERT INTO type_interfaces(type_id, iface_full, iface_simple) VALUES($tid, $full, $simple);";
+        var pITid = ifaceCmd.Parameters.Add("$tid", SqliteType.Integer);
+        var pIFull = ifaceCmd.Parameters.Add("$full", SqliteType.Text);
+        var pISimple = ifaceCmd.Parameters.Add("$simple", SqliteType.Text);
+
+        using var memCmd = conn.CreateCommand();
+        memCmd.Transaction = tx;
+        memCmd.CommandText = @"
+INSERT INTO members(id, type_id, assembly_id, kind, name, accessibility, modifiers, return_type, return_simple,
+                    signature, param_types, ext_target_type, ext_target_simple, enum_value, summary, params_doc, returns_doc, doc_id)
+VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
+       $sig, $ptypes, $extT, $extS, $eval, $sum, $pdoc, $rdoc, $docId);";
+        var pMId = memCmd.Parameters.Add("$id", SqliteType.Integer);
+        var pMTid = memCmd.Parameters.Add("$tid", SqliteType.Integer);
+        var pMAid = memCmd.Parameters.Add("$aid", SqliteType.Integer);
+        var pMKind = memCmd.Parameters.Add("$kind", SqliteType.Text);
+        var pMName = memCmd.Parameters.Add("$name", SqliteType.Text);
+        var pMAcc = memCmd.Parameters.Add("$acc", SqliteType.Text);
+        var pMMod = memCmd.Parameters.Add("$mod", SqliteType.Text);
+        var pMRet = memCmd.Parameters.Add("$ret", SqliteType.Text);
+        var pMRetS = memCmd.Parameters.Add("$retS", SqliteType.Text);
+        var pMSig = memCmd.Parameters.Add("$sig", SqliteType.Text);
+        var pMPtypes = memCmd.Parameters.Add("$ptypes", SqliteType.Text);
+        var pMExtT = memCmd.Parameters.Add("$extT", SqliteType.Text);
+        var pMExtS = memCmd.Parameters.Add("$extS", SqliteType.Text);
+        var pMEval = memCmd.Parameters.Add("$eval", SqliteType.Text);
+        var pMSum = memCmd.Parameters.Add("$sum", SqliteType.Text);
+        var pMPdoc = memCmd.Parameters.Add("$pdoc", SqliteType.Text);
+        var pMRdoc = memCmd.Parameters.Add("$rdoc", SqliteType.Text);
+        var pMDocId = memCmd.Parameters.Add("$docId", SqliteType.Text);
+
+        using var extTargetCmd = conn.CreateCommand();
+        extTargetCmd.Transaction = tx;
+        extTargetCmd.CommandText = "INSERT INTO extension_targets(member_id, target_full, target_simple) VALUES($mid, $tf, $ts);";
+        var pETMid = extTargetCmd.Parameters.Add("$mid", SqliteType.Integer);
+        var pETFull = extTargetCmd.Parameters.Add("$tf", SqliteType.Text);
+        var pETSimple = extTargetCmd.Parameters.Add("$ts", SqliteType.Text);
+
+        using var typeRefCmd = conn.CreateCommand();
+        typeRefCmd.Transaction = tx;
+        typeRefCmd.CommandText = "INSERT INTO member_type_refs(member_id, type_full, type_simple, role) VALUES($mid, $tf, $ts, $role);";
+        var pRMid = typeRefCmd.Parameters.Add("$mid", SqliteType.Integer);
+        var pRTf = typeRefCmd.Parameters.Add("$tf", SqliteType.Text);
+        var pRTs = typeRefCmd.Parameters.Add("$ts", SqliteType.Text);
+        var pRRole = typeRefCmd.Parameters.Add("$role", SqliteType.Text);
+
+        using var ftsCmd = conn.CreateCommand();
+        ftsCmd.Transaction = tx;
+        ftsCmd.CommandText = @"
+INSERT INTO fts_entries(entity_type, entity_id, kind, assembly_name, namespace, full_name, name, tokens, summary)
+VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
+        var pFEt = ftsCmd.Parameters.Add("$et", SqliteType.Text);
+        var pFEid = ftsCmd.Parameters.Add("$eid", SqliteType.Integer);
+        var pFKind = ftsCmd.Parameters.Add("$kind", SqliteType.Text);
+        var pFAname = ftsCmd.Parameters.Add("$aname", SqliteType.Text);
+        var pFNs = ftsCmd.Parameters.Add("$ns", SqliteType.Text);
+        var pFFull = ftsCmd.Parameters.Add("$full", SqliteType.Text);
+        var pFName = ftsCmd.Parameters.Add("$name", SqliteType.Text);
+        var pFTokens = ftsCmd.Parameters.Add("$tokens", SqliteType.Text);
+        var pFSum = ftsCmd.Parameters.Add("$sum", SqliteType.Text);
+
+        long nextAsmId = 0;
+        long nextTypeId = 0;
+        long nextMemId = 0;
+
+        while (reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+        {
+            while (reader.TryRead(out var asm))
+            {
+                var asmId = ++nextAsmId;
+                pAsmId.Value = asmId;
+                pAsmName.Value = asm.Name;
+                pAsmPath.Value = asm.Path;
+                pAsmVer.Value = asm.Version;
+                pAsmXml.Value = (object?)asm.XmlPath ?? DBNull.Value;
+                pAsmSize.Value = asm.FileSize;
+                pAsmMtime.Value = asm.MtimeUtc;
+                pAsmTCount.Value = asm.Types.Count;
+                asmCmd.ExecuteNonQuery();
+
+                foreach (var t in asm.Types)
+                {
+                    var typeId = ++nextTypeId;
+                    pTId.Value = typeId;
+                    pTAid.Value = asmId;
+                    pTFull.Value = t.FullName;
+                    pTBareFull.Value = t.BareFullName;
+                    pTClr.Value = t.ClrName;
+                    pTNs.Value = t.Namespace;
+                    pTName.Value = t.Name;
+                    pTSimple.Value = t.SimpleName;
+                    pTKind.Value = t.Kind;
+                    pTAcc.Value = t.Accessibility;
+                    pTMod.Value = t.Modifiers;
+                    pTBase.Value = (object?)t.BaseType ?? DBNull.Value;
+                    pTBaseBare.Value = (object?)t.BaseBare ?? DBNull.Value;
+                    pTBaseS.Value = (object?)t.BaseSimple ?? DBNull.Value;
+                    pTIfaces.Value = t.Interfaces;
+                    pTGp.Value = t.GenericParams;
+                    pTGcon.Value = t.GenericConstraints;
+                    pTDsig.Value = (object?)t.DelegateSignature ?? DBNull.Value;
+                    pTExt.Value = t.IsExtensionContainer ? 1 : 0;
+                    pTSum.Value = (object?)t.Summary ?? DBNull.Value;
+                    pTRem.Value = (object?)t.Remarks ?? DBNull.Value;
+                    pTDocId.Value = t.DocId;
+                    typeCmd.ExecuteNonQuery();
+
+                    foreach (var iface in t.InterfaceRefs)
+                    {
+                        pITid.Value = typeId;
+                        pIFull.Value = iface.FullName;
+                        pISimple.Value = iface.SimpleName;
+                        ifaceCmd.ExecuteNonQuery();
+                    }
+
+                    var tTokens = Tokenizer.BuildSearchTokens(t.SimpleName, t.FullName, t.BaseSimple, t.Interfaces);
+                    var tCjk = Tokenizer.BuildCjkSummaryTokens(t.Summary);
+                    if (tCjk.Length > 0)
+                        tTokens = string.IsNullOrEmpty(tTokens) ? tCjk : $"{tTokens} {tCjk}";
+
+                    pFEt.Value = "type";
+                    pFEid.Value = typeId;
+                    pFKind.Value = t.Kind;
+                    pFAname.Value = asm.Name;
+                    pFNs.Value = t.Namespace;
+                    pFFull.Value = t.FullName;
+                    pFName.Value = t.SimpleName;
+                    pFTokens.Value = tTokens;
+                    pFSum.Value = t.Summary ?? string.Empty;
+                    ftsCmd.ExecuteNonQuery();
+
+                    foreach (var m in t.Members)
+                    {
+                        var memId = ++nextMemId;
+                        pMId.Value = memId;
+                        pMTid.Value = typeId;
+                        pMAid.Value = asmId;
+                        pMKind.Value = m.Kind;
+                        pMName.Value = m.Name;
+                        pMAcc.Value = m.Accessibility;
+                        pMMod.Value = m.Modifiers;
+                        pMRet.Value = m.ReturnType;
+                        pMRetS.Value = m.ReturnSimple;
+                        pMSig.Value = m.Signature;
+                        pMPtypes.Value = m.ParamTypes;
+                        pMExtT.Value = (object?)m.ExtTargetType ?? DBNull.Value;
+                        pMExtS.Value = (object?)m.ExtTargetSimple ?? DBNull.Value;
+                        pMEval.Value = (object?)m.EnumValue ?? DBNull.Value;
+                        pMSum.Value = (object?)m.Summary ?? DBNull.Value;
+                        pMPdoc.Value = (object?)m.ParamsDoc ?? DBNull.Value;
+                        pMRdoc.Value = (object?)m.ReturnsDoc ?? DBNull.Value;
+                        pMDocId.Value = m.DocId;
+                        memCmd.ExecuteNonQuery();
+
+                        foreach (var et in m.ExtensionTargets)
+                        {
+                            pETMid.Value = memId;
+                            pETFull.Value = et.TargetFull;
+                            pETSimple.Value = et.TargetSimple;
+                            extTargetCmd.ExecuteNonQuery();
+                        }
+
+                        foreach (var tr in m.TypeRefs)
+                        {
+                            pRMid.Value = memId;
+                            pRTf.Value = tr.TypeFull;
+                            pRTs.Value = tr.TypeSimple;
+                            pRRole.Value = tr.Role;
+                            typeRefCmd.ExecuteNonQuery();
+                        }
+
+                        // Skip indexing trivial parameterless constructors in FTS5 (already covered by the type entry)
+                        if (m.Kind == "ctor" && string.IsNullOrEmpty(m.ParamTypes))
+                            continue;
+
+                        var mTokens = Tokenizer.BuildSearchTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes);
+                        var mCjk = Tokenizer.BuildCjkSummaryTokens(m.Summary);
+                        if (mCjk.Length > 0)
+                            mTokens = string.IsNullOrEmpty(mTokens) ? mCjk : $"{mTokens} {mCjk}";
+
+                        pFEt.Value = "member";
+                        pFEid.Value = memId;
+                        pFKind.Value = m.Kind;
+                        pFAname.Value = asm.Name;
+                        pFNs.Value = t.Namespace;
+                        pFFull.Value = $"{t.FullName}.{m.Name}";
+                        pFName.Value = m.Name;
+                        pFTokens.Value = mTokens;
+                        pFSum.Value = m.Summary ?? string.Empty;
+                        ftsCmd.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+    }
+
+    private static void ExecuteNonQuery(SqliteConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+}

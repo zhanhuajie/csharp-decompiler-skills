@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore ApiLookup.sln
+
+      - name: Build and test
+        run: dotnet test ApiLookup.sln -c Release --no-restore --verbosity normal
+
+      - name: Verify dotnet tool pack
+        run: dotnet pack src/ApiLookup/ApiLookup.csproj -c Release -o pack-check
+
+      - name: Verify single-file publish & prebuilt binary version (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r win-x64 --no-self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-check
+          $builtVer = (./publish-check/apilookup.exe --version).Trim()
+          $repoVer = (./csharp-definition-lookup/scripts/apilookup.exe --version).Trim()
+          Write-Host "Built: $builtVer | Prebuilt: $repoVer"
+          if ($builtVer -ne $repoVer) {
+            throw "Prebuilt apilookup.exe ($repoVer) is out of sync with source ($builtVer). Run .\tools\build.ps1."
+          }
+
+      - name: Verify single-file publish (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r linux-x64 --no-self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-check
+          ./publish-check/apilookup --version

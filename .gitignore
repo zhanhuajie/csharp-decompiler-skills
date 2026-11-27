@@ -1,1 +1,14 @@
 .vs/
+.idea/
+*.user
+*.suo
+**/bin/
+**/obj/
+TestResults/
+publish-check/
+pack-check/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.lock
