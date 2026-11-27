@@ -187,6 +187,11 @@ namespace ApiLookup.Tests.Fixtures
     public class Rankingtest
     {
     }
+
+    internal sealed class InternalFixtureHelper
+    {
+        public int SecretCode { get; set; }
+    }
 }
 
 namespace ApiLookup.Tests.OtherNs

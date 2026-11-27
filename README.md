@@ -72,6 +72,9 @@ apilookup.exe show Wall --index revit2026 --member Create --docs
 apilookup.exe hierarchy Autodesk.ProcessPower.PnP3dObjects.Part --index acad2025
 apilookup.exe by-type DataLinksManager3d --index acad2025
 
+# Fast zero-cache scan to locate which DLL defines a type (including internal types with --include-nonpublic)
+apilookup.exe locate Equipment --project C:\repo\MyApp\MyApp.csproj --list-refs
+
 # Ad-hoc search against a .csproj (auto-cached by fingerprint)
 apilookup.exe search Asset --project C:\repo\MyApp\MyApp.csproj --list-refs
 ```
@@ -126,7 +129,6 @@ csharp-definition-lookup/
   SKILL.md                 # Skill guide for AI agents
   scripts/
     apilookup.exe          # Prebuilt Windows single-file CLI (framework-dependent)
-    TypeScanner.csx        # Legacy dotnet-script scanner (deprecated)
 csharp-decompiler/
   SKILL.md                 # Skill guide for AI agents
 ```

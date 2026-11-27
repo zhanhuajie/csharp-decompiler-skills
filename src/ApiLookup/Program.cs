@@ -6,7 +6,7 @@ namespace ApiLookup;
 public static class Program
 {
     private static readonly HashSet<string> KnownCommands = new(StringComparer.OrdinalIgnoreCase)
-        { "index", "search", "show", "hierarchy", "by-type", "refs" };
+        { "index", "search", "show", "hierarchy", "by-type", "refs", "locate", "scan" };
 
     private static readonly HashSet<string> ValidKinds = new(StringComparer.OrdinalIgnoreCase)
         { "type", "member", "class", "struct", "interface", "enum", "delegate", "method", "property", "ctor", "field", "event" };
@@ -81,6 +81,9 @@ public static class Program
                 return RunByType(opts, outWriter, errWriter);
             case "refs":
                 return RunRefs(opts, outWriter, errWriter);
+            case "locate":
+            case "scan":
+                return RunLocate(opts, outWriter, errWriter);
             default:
                 errWriter.WriteLine($"Unknown command: {opts.Command}. Run 'apilookup --help' for usage.");
                 return 1;
@@ -244,6 +247,83 @@ public static class Program
         using var store = OpenIndexForQuery(opts, errWriter);
         OutputFormatter.WriteAssemblies(store.ListAssemblies(), opts.Json, outWriter);
         return 0;
+    }
+
+    private static int RunLocate(CliOptions opts, TextWriter outWriter, TextWriter errWriter)
+    {
+        if (opts.Positional.Count == 0)
+            throw new ArgumentException("locate requires a <TypeName> argument.");
+
+        var typeQuery = opts.Positional[0];
+        var limit = opts.Limit ?? 100;
+
+        if (HasExplicitSources(opts))
+        {
+            var resolved = SourceResolver.Resolve(
+                opts.Projects,
+                opts.Dirs,
+                opts.Dlls,
+                opts.Recursive,
+                opts.IncludePatterns,
+                opts.ExcludePatterns,
+                opts.IncludeNonPublic,
+                opts.TargetFramework);
+
+            if (!opts.Json || opts.Verbose)
+            {
+                foreach (var w in resolved.Warnings)
+                    errWriter.WriteLine($"Warning: {w}");
+            }
+
+            if (resolved.Assemblies.Count == 0)
+                throw new InvalidOperationException("No managed .NET assemblies found in the specified sources.");
+
+            IReadOnlyList<ResolvedRefGroup>? refGroups = null;
+            if (opts.ListRefs)
+            {
+                refGroups = resolved.Assemblies
+                    .GroupBy(a => a.Group, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => new ResolvedRefGroup(g.First().Group, g.Count()))
+                    .ToList();
+            }
+
+            var scanWarnings = new List<string>();
+            var hits = TypeLocator.Locate(
+                resolved.Assemblies,
+                typeQuery,
+                opts.NamespaceFilter,
+                opts.AssemblyFilter,
+                opts.IncludeNonPublic,
+                limit,
+                scanWarnings);
+
+            if (opts.Verbose)
+            {
+                foreach (var w in scanWarnings)
+                    errWriter.WriteLine($"Warning: {w}");
+            }
+
+            OutputFormatter.WriteLocateHits(typeQuery, resolved.Assemblies.Count, refGroups, hits, opts.Json, outWriter);
+            return 0;
+        }
+
+        if (!string.IsNullOrWhiteSpace(opts.IndexName) || !string.IsNullOrWhiteSpace(opts.DbPath))
+        {
+            var dbPath = IndexStore.ResolveDbPath(opts.IndexName, opts.DbPath, sourceKey: null);
+            using var store = IndexStore.OpenReadOnly(dbPath);
+            var assemblies = store.ListAssemblies();
+            var matches = store.ResolveType(typeQuery, opts.NamespaceFilter, opts.AssemblyFilter)
+                .Take(limit)
+                .Select(t => new LocateHit(t.FullName, t.ClrName, t.Namespace, t.SimpleName, t.Accessibility, t.AssemblyName, t.AssemblyPath, t.AssemblyName))
+                .ToList();
+            IReadOnlyList<ResolvedRefGroup>? refGroups = opts.ListRefs
+                ? assemblies.Select(a => new ResolvedRefGroup(a.Name, 1)).ToList()
+                : null;
+            OutputFormatter.WriteLocateHits(typeQuery, assemblies.Count, refGroups, matches, opts.Json, outWriter);
+            return 0;
+        }
+
+        throw new ArgumentException("No source or index specified. Pass --dir <path>, --project <csproj>, --dll <path>, or --index <name>.");
     }
 
     private static IndexStore OpenIndexForQuery(CliOptions opts, TextWriter errWriter)
@@ -494,6 +574,7 @@ Commands:
   show <TypeName>              Print clean C# API skeleton (members, XML docs, inherited, extensions)
   hierarchy <TypeName>         Show base class chain, interfaces, and derived/implementing types
   by-type <TypeName>           Find methods/properties/ctors returning or accepting <TypeName>
+  locate <TypeName>            Fast zero-cache PE scan to locate a type's DLL & namespace (alias: scan)
   refs                         List indexed assemblies and XML doc availability
 
 Source & Index Options (usable on any command; auto-cached by file fingerprint):

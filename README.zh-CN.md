@@ -72,6 +72,9 @@ apilookup.exe show Wall --index revit2026 --member Create --docs
 apilookup.exe hierarchy Autodesk.ProcessPower.PnP3dObjects.Part --index acad2025
 apilookup.exe by-type DataLinksManager3d --index acad2025
 
+# 零缓存快速定位某个类型所在的 DLL 与命名空间（可配合 --include-nonpublic 扫描 internal 类型）
+apilookup.exe locate Equipment --project C:\repo\MyApp\MyApp.csproj --list-refs
+
 # 直接查询 .csproj 引用（自动按文件指纹缓存）
 apilookup.exe search Asset --project C:\repo\MyApp\MyApp.csproj --list-refs
 ```
@@ -126,7 +129,6 @@ csharp-definition-lookup/
   SKILL.md                 # 技能描述与用法（供 AI Agent 加载）
   scripts/
     apilookup.exe          # 预编译 Windows 单文件 CLI（框架依赖）
-    TypeScanner.csx        # 旧版 dotnet-script 扫描脚本（已弃用）
 csharp-decompiler/
   SKILL.md                 # 技能描述与用法（供 AI Agent 加载）
 ```

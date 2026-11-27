@@ -89,5 +89,21 @@ public class CliTests : IDisposable
         {
             Assert.False(doc.RootElement.GetProperty("dropped").GetBoolean());
         }
+
+        // 7. locate / scan zero-cache PE scan with --list-refs --json & --include-nonpublic
+        var locOut = new StringWriter();
+        Assert.Equal(0, Program.Run(new[] { "locate", "InternalFixtureHelper", "--dll", _fixtureDll, "--include-nonpublic", "--list-refs", "--json" }, locOut, new StringWriter()));
+        using (var doc = JsonDocument.Parse(locOut.ToString()))
+        {
+            Assert.Equal(1, doc.RootElement.GetProperty("scannedAssemblies").GetInt32());
+            Assert.Equal(1, doc.RootElement.GetProperty("references").GetArrayLength());
+            var matches = doc.RootElement.GetProperty("matches");
+            Assert.Equal(1, matches.GetArrayLength());
+            Assert.Equal("ApiLookup.Tests.Fixtures.InternalFixtureHelper", matches[0].GetProperty("FullName").GetString());
+        }
+
+        var scanTextOut = new StringWriter();
+        Assert.Equal(0, Program.Run(new[] { "scan", "SamplePipeSegment", "--db", dbPath }, scanTextOut, new StringWriter()));
+        Assert.Contains("[FOUND] ApiLookup.Tests.Fixtures.SamplePipeSegment", scanTextOut.ToString());
     }
 }

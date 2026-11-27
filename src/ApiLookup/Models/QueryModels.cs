@@ -118,3 +118,23 @@ public sealed record PruneResult(
     [property: JsonPropertyName("removedCount")] int RemovedCount,
     [property: JsonPropertyName("freedBytes")] long FreedBytes,
     [property: JsonPropertyName("removedFiles")] IReadOnlyList<string> RemovedFiles);
+
+public sealed record LocateHit(
+    string FullName,
+    string ClrName,
+    string Namespace,
+    string SimpleName,
+    string Accessibility,
+    string AssemblyName,
+    string AssemblyPath,
+    string Group);
+
+public sealed record ResolvedRefGroup(
+    [property: JsonPropertyName("group")] string Group,
+    [property: JsonPropertyName("count")] int Count);
+
+public sealed record LocateJsonResult(
+    [property: JsonPropertyName("query")] string Query,
+    [property: JsonPropertyName("scannedAssemblies")] int ScannedAssemblies,
+    [property: JsonPropertyName("references")] IReadOnlyList<ResolvedRefGroup>? References,
+    [property: JsonPropertyName("matches")] IReadOnlyList<LocateHit> Matches);

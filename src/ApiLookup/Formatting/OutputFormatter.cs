@@ -349,6 +349,45 @@ public static class OutputFormatter
         }
     }
 
+    public static void WriteLocateHits(
+        string query,
+        int scannedAssemblies,
+        IReadOnlyList<ResolvedRefGroup>? references,
+        IReadOnlyList<LocateHit> hits,
+        bool json,
+        TextWriter? output = null)
+    {
+        if (json)
+        {
+            WriteJson(new LocateJsonResult(query, scannedAssemblies, references, hits), ApiLookupJsonContext.Default.LocateJsonResult, output);
+            return;
+        }
+
+        var w = output ?? Console.Out;
+        if (references != null && references.Count > 0)
+        {
+            w.WriteLine("Resolved DLL references:");
+            foreach (var r in references)
+                w.WriteLine($"  {r.Group} ({r.Count} dlls)");
+            w.WriteLine();
+        }
+
+        if (hits.Count == 0)
+        {
+            w.WriteLine($"Type \"{query}\" not found in {scannedAssemblies} assemblies.");
+            return;
+        }
+
+        w.WriteLine($"Located \"{query}\" across {scannedAssemblies} assemblies ({hits.Count} match(es)):\n");
+        foreach (var h in hits)
+        {
+            w.WriteLine($"[FOUND] {h.FullName}  ({h.Accessibility}, {h.AssemblyName})");
+            if (!string.Equals(h.ClrName, h.FullName, StringComparison.Ordinal))
+                w.WriteLine($"  CLR Name: {h.ClrName}");
+            w.WriteLine($"  Assembly: {h.AssemblyPath}");
+        }
+    }
+
     private static string Truncate(string text, int maxLen)
         => text.Length <= maxLen ? text : text[..(maxLen - 1)] + "…";
 }

@@ -16,6 +16,7 @@ namespace ApiLookup;
 [JsonSerializable(typeof(IReadOnlyList<AssemblyRow>))]
 [JsonSerializable(typeof(DropIndexResult))]
 [JsonSerializable(typeof(PruneResult))]
+[JsonSerializable(typeof(LocateJsonResult))]
 public partial class ApiLookupJsonContext : JsonSerializerContext
 {
 }

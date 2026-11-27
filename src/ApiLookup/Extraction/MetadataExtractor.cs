@@ -137,7 +137,7 @@ public static class MetadataExtractor
         return lookup;
     }
 
-    private static bool ShouldSkipType(MetadataReader md, TypeDefinition td, string rawName, bool includeNonPublic)
+    internal static bool ShouldSkipType(MetadataReader md, TypeDefinition td, string rawName, bool includeNonPublic)
     {
         if (rawName == "<Module>" || rawName.StartsWith('<') || rawName.Contains("<>"))
             return true;
@@ -152,7 +152,7 @@ public static class MetadataExtractor
         return false;
     }
 
-    private static string GetEffectiveVisibility(MetadataReader md, TypeDefinition td)
+    internal static string GetEffectiveVisibility(MetadataReader md, TypeDefinition td)
     {
         var vis = td.Attributes & TypeAttributes.VisibilityMask;
         if (!td.IsNested)
@@ -227,7 +227,7 @@ public static class MetadataExtractor
             Members: members);
     }
 
-    private static (string ns, string clrName, string displayFull, string bareFull, string displayName, string simpleName)
+    internal static (string ns, string clrName, string displayFull, string bareFull, string displayName, string simpleName)
         BuildTypeNames(MetadataReader md, TypeDefinition td)
     {
         var chain = new List<TypeDefinition>();

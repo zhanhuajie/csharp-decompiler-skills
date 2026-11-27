@@ -23,6 +23,7 @@ No `dotnet-script` required.
 | `show <TypeName>` | Print clean C# API skeleton (constructors, properties, methods, events, fields/enums, delegates) |
 | `hierarchy <TypeName>` | Show base class chain, interfaces, and all derived/implementing types |
 | `by-type <TypeName>` | Reverse-lookup members returning or accepting `<TypeName>` (including inside generic containers) |
+| `locate <TypeName>` | Fast zero-cache PE scan to locate a type's exact DLL & namespace (alias: `scan`) |
 | `index` | Build/refresh a named index (`--name`), list (`--list`), delete (`--drop`), or prune auto-cache (`--prune`) |
 | `refs` | List indexed assemblies, versions, type counts, and XML doc availability |
 
@@ -104,4 +105,4 @@ Escalate to `csharp-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when
 - **Structured output**: Any command supports `--json` (including `search --list-refs --json` and `index --drop`/`--prune --json`).
 - **Diagnostics & Version**: Pass `--verbose` to inspect metadata/XML warnings on stderr, and `--version` to check the CLI version.
 - **Exit codes**: `0` success, `1` error or type not found, `2` ambiguous type match in `show`/`hierarchy` (candidates printed to stdout).
-- **Legacy script**: `scripts/TypeScanner.csx` is retained for backwards compatibility, but `apilookup.exe` supersedes it.
+- **Zero-cache DLL scan**: Use `locate <TypeName>` (alias `scan`) with `--project` / `--dir` / `--dll` when you only want to find which DLL defines a type without creating a SQLite index (supports `--include-nonpublic`, `--list-refs`, `--ns`, `--asm`, `--json`).
