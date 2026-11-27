@@ -19,11 +19,11 @@ No `dotnet-script` required.
 
 | Command | Purpose |
 | --- | --- |
-| `search <query>` | Full-text + CamelCase search across types, members, and XML `<summary>` docs |
-| `show <TypeName>` | Print clean C# API skeleton (constructors, properties, methods, events, fields/enums) |
+| `search <query>` | Full-text, CamelCase & CJK/Chinese search across types, members, and XML `<summary>` docs |
+| `show <TypeName>` | Print clean C# API skeleton (constructors, properties, methods, events, fields/enums, delegates) |
 | `hierarchy <TypeName>` | Show base class chain, interfaces, and all derived/implementing types |
-| `by-type <TypeName>` | Reverse-lookup members returning or accepting `<TypeName>` |
-| `index` | Build/refresh a named index (`--name`), list indexes (`--list`), or delete (`--drop`) |
+| `by-type <TypeName>` | Reverse-lookup members returning or accepting `<TypeName>` (including inside generic containers) |
+| `index` | Build/refresh a named index (`--name`), list (`--list`), delete (`--drop`), or prune auto-cache (`--prune`) |
 | `refs` | List indexed assemblies, versions, type counts, and XML doc availability |
 
 ## Specifying Sources (Auto-Cached)
@@ -31,10 +31,10 @@ No `dotnet-script` required.
 Every command accepts any combination of `--dir`, `--project`, `--dll`, or a previously built `--index <name>`:
 
 - `--dir <path>` (repeatable): Recursively scan managed `.dll`s (automatically skips native-only binaries, `*.resources.dll`, and locale folders). Pair with `--include <glob>` / `--exclude <glob>` (e.g. `--exclude "DevExpress.*"`) to keep large SDK directories small and fast.
-- `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first) plus `<HintPath>` references.
+- `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first) plus `<HintPath>` references (expands `$(ProjectDir)` / `$(SolutionDir)`). For multi-TFM projects, automatically selects the highest framework or pass `--tfm <tfm>` (e.g. `--tfm net8.0`).
 - `--dll <path.dll>` (repeatable): Index specific assembly files directly.
 - `--index <name>` (alias `--name`): Build once with `index --name <name> ...`, then reuse instantly (`<50 ms`) across queries.
-- Ad-hoc `--dir`/`--project`/`--dll` queries are **auto-cached** by file size + mtime fingerprint in `%LOCALAPPDATA%\csharp-api-lookup\indexes\` (or `~/.cache/csharp-api-lookup/indexes/`).
+- Ad-hoc `--dir`/`--project`/`--dll` queries are **auto-cached** by file size + mtime fingerprint in `%LOCALAPPDATA%\csharp-api-lookup\indexes\` (or `~/.cache/csharp-api-lookup/indexes/`). Run `apilookup.exe index --prune` to clean up old `auto-*.db` files.
 
 ## Recommended Workflows
 
@@ -101,5 +101,7 @@ Escalate to `csharp-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when
 - **Use `--member <substring>`** on huge classes (like `Database`, `Document`, `UIDocument`) to keep output concise.
 - **Filter large install directories** with `--include` / `--exclude` (e.g. `--exclude "DevExpress.*"`) to avoid indexing hundreds of bundled third-party UI DLLs.
 - **Non-public members**: By default only `public` and `protected` APIs are indexed (which also strips C++/CLI native internal structs). Pass `--include-nonpublic` if reverse-engineering internal types.
-- **Structured output**: Any command supports `--json`.
+- **Structured output**: Any command supports `--json` (including `search --list-refs --json` and `index --drop`/`--prune --json`).
+- **Diagnostics & Version**: Pass `--verbose` to inspect metadata/XML warnings on stderr, and `--version` to check the CLI version.
+- **Exit codes**: `0` success, `1` error or type not found, `2` ambiguous type match in `show`/`hierarchy` (candidates printed to stdout).
 - **Legacy script**: `scripts/TypeScanner.csx` is retained for backwards compatibility, but `apilookup.exe` supersedes it.

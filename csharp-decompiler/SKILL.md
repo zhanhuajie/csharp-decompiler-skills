@@ -61,7 +61,7 @@ Use this name verbatim as `<full_type_name>` in subsequent commands. Nested clas
 
 For large types with many members, get a quick overview of the public API without reading the full implementation.
 
-> **Note**: `ilspycmd` writes to **stderr**, not stdout. Direct piping is unreliable across PowerShell versions. Always use file redirection.
+> **Note**: `ilspycmd` emits version warnings/diagnostics to **stderr** while writing decompiled source to **stdout**. Direct piping in PowerShell 5.1 can fail on stderr output; always use file redirection (`2>&1 >`).
 
 **Windows (PowerShell):**
 
@@ -109,7 +109,7 @@ Decompile the entire assembly into a C# project structure (.csproj and .cs files
 - **Narrow Search**: Use `-l s` first to confirm the exact type name before decompiling.
 - **Large Types**: For types with 50+ members, use the API Surface Overview step first to understand the structure before reading full source.
 - **Full Type Names**: Always include the namespace (e.g., `MyCompany.Services.AuthService`) for precise decompilation.
-- **Always Use File Redirection**: All `ilspycmd` commands write to stderr. Always redirect with `2>&1 >` (Windows) or `> file 2>&1` (Linux/macOS) and read the output file. Terminal output will be truncated or empty.
+- **Always Use File Redirection**: `ilspycmd` may emit warnings/diagnostics to stderr alongside stdout source output. Always redirect with `2>&1 >` (Windows) or `> file 2>&1` (Linux/macOS) and read the output file. Terminal output will be truncated or noisy.
 
 ## Troubleshooting & Advanced
 

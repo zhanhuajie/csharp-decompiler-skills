@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace ApiLookup;
@@ -61,28 +62,44 @@ public static partial class XmlDocReader
         return null;
     }
 
-    public static XmlDocBook Load(string? xmlPath)
+    public static XmlDocBook Load(string? xmlPath, List<string>? warnings = null)
     {
         if (string.IsNullOrEmpty(xmlPath) || !File.Exists(xmlPath))
             return XmlDocBook.Empty;
 
         var exact = new Dictionary<string, XmlDocEntry>(StringComparer.Ordinal);
-        var fallback = new Dictionary<string, XmlDocEntry>(StringComparer.Ordinal);
+        var fallback = new Dictionary<string, XmlDocEntry?>(StringComparer.Ordinal);
 
         try
         {
-            var doc = XDocument.Load(xmlPath, LoadOptions.None);
-            var members = doc.Root?.Element("members")?.Elements("member");
-            if (members == null) return XmlDocBook.Empty;
-
-            foreach (var m in members)
+            using var reader = XmlReader.Create(xmlPath, new XmlReaderSettings
             {
+                DtdProcessing = DtdProcessing.Ignore,
+                IgnoreComments = true,
+            });
+
+            while (reader.Read())
+            {
+                if (reader.NodeType != XmlNodeType.Element || reader.Name != "member")
+                    continue;
+
+                using var sub = reader.ReadSubtree();
+                sub.MoveToContent();
+                if (XNode.ReadFrom(sub) is not XElement m)
+                    continue;
+
                 var name = m.Attribute("name")?.Value?.Trim();
                 if (string.IsNullOrEmpty(name)) continue;
 
                 var summary = CleanText(m.Element("summary"));
                 var remarks = CleanText(m.Element("remarks"));
                 var returns = CleanText(m.Element("returns"));
+                var valueDoc = CleanText(m.Element("value"));
+
+                if (returns == null && valueDoc != null)
+                    returns = valueDoc;
+                if (summary == null && valueDoc != null)
+                    summary = valueDoc;
 
                 var paramDict = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var p in m.Elements("param"))
@@ -93,27 +110,36 @@ public static partial class XmlDocReader
                         paramDict[pName] = pText;
                 }
 
-                if (summary == null && remarks == null && returns == null && paramDict.Count == 0)
+                if (summary == null && remarks == null && returns == null && valueDoc == null && paramDict.Count == 0)
                     continue;
 
                 var entry = new XmlDocEntry(summary, remarks, returns, paramDict);
                 exact[name] = entry;
 
-                // Fallback key for methods with C++/CLI signature quirks: M:FullType.MethodName#paramCount
+                // Fallback key for methods with C++/CLI signature quirks: M:FullType.MethodName#paramCount.
+                // Only enable when unique in this XML file so same-arity overloads never steal another overload's doc.
                 if (name.StartsWith("M:", StringComparison.Ordinal))
                 {
                     var fbKey = BuildMethodFallbackKey(name);
-                    if (fbKey != null && !fallback.ContainsKey(fbKey))
-                        fallback[fbKey] = entry;
+                    if (fbKey != null && !fallback.TryAdd(fbKey, entry))
+                        fallback[fbKey] = null;
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
+            warnings?.Add($"Failed to parse XML doc '{xmlPath}': {ex.Message}");
             return XmlDocBook.Empty;
         }
 
-        return new XmlDocBook(exact, fallback);
+        var uniqueFallback = new Dictionary<string, XmlDocEntry>(StringComparer.Ordinal);
+        foreach (var kv in fallback)
+        {
+            if (kv.Value != null)
+                uniqueFallback[kv.Key] = kv.Value;
+        }
+
+        return new XmlDocBook(exact, uniqueFallback);
     }
 
     public static string? BuildMethodFallbackKey(string docId)
@@ -186,9 +212,18 @@ public static partial class XmlDocReader
                             sb.Append('`').Append(child.Value.Trim()).Append('`');
                             break;
                         case "para":
+                        case "list":
+                        case "item":
+                        case "listheader":
+                        case "description":
                             sb.Append(' ');
                             AppendNodeText(child, sb);
                             sb.Append(' ');
+                            break;
+                        case "term":
+                            sb.Append(' ');
+                            AppendNodeText(child, sb);
+                            sb.Append(": ");
                             break;
                         default:
                             AppendNodeText(child, sb);

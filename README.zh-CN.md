@@ -30,7 +30,7 @@
 .\tools\build.ps1
 
 # 运行单元测试
-dotnet test .\src\ApiLookup.Tests\ApiLookup.Tests.csproj -c Release
+dotnet test .\ApiLookup.sln -c Release
 ```
 
 Linux/macOS 可直接通过 `dotnet run --project src/ApiLookup -- <参数>` 运行，或使用 `-r linux-x64` / `-r osx-arm64` 发布。
@@ -109,16 +109,24 @@ csharp-decompiler (ilspycmd)          ──►  反编译完整 C# 实现源码
 ## 目录结构
 
 ```text
+ApiLookup.sln
+Directory.Build.props
+.github/workflows/ci.yml
 src/
   ApiLookup/               # .NET 8 CLI（System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5）
-  ApiLookup.Tests/         # xUnit 单元测试
+    Cli/                   # 命令行参数解析
+    Extraction/            # PE 元数据、XML 注释、签名解码、中英文分词与源解析
+    Formatting/            # 文本/JSON 输出格式化与源生成序列化上下文
+    Models/                # 元数据与查询结果数据模型
+    Storage/               # 缓存目录管理、流式并发建库与索引化 SQLite 查询
+  ApiLookup.Tests/         # xUnit 单元测试与集成测试
 tools/
   build.ps1                # 发布 apilookup 到 csharp-definition-lookup/scripts/
 csharp-definition-lookup/
   SKILL.md                 # 技能描述与用法（供 AI Agent 加载）
   scripts/
     apilookup.exe          # 预编译 Windows 单文件 CLI（框架依赖）
-    TypeScanner.csx        # 旧版 dotnet-script 扫描脚本
+    TypeScanner.csx        # 旧版 dotnet-script 扫描脚本（已弃用）
 csharp-decompiler/
   SKILL.md                 # 技能描述与用法（供 AI Agent 加载）
 ```

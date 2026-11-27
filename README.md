@@ -30,7 +30,7 @@ A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/
 .\tools\build.ps1
 
 # Run unit tests
-dotnet test .\src\ApiLookup.Tests\ApiLookup.Tests.csproj -c Release
+dotnet test .\ApiLookup.sln -c Release
 ```
 
 On Linux/macOS, invoke directly via `dotnet run --project src/ApiLookup -- <args>` or publish with `-r linux-x64` / `-r osx-arm64`.
@@ -109,16 +109,24 @@ csharp-decompiler (ilspycmd)          ──►  Full C# decompiled implementati
 ## Repository Structure
 
 ```text
+ApiLookup.sln
+Directory.Build.props
+.github/workflows/ci.yml
 src/
   ApiLookup/               # .NET 8 CLI (System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5)
-  ApiLookup.Tests/         # xUnit tests
+    Cli/                   # CLI option parsing
+    Extraction/            # Metadata, XML doc, signature decoder, tokenizer & source resolver
+    Formatting/            # Text/JSON formatters + System.Text.Json source-gen context
+    Models/                # Extracted & query DTO records
+    Storage/               # Index catalog, parallel streaming builder, indexed SQLite query store
+  ApiLookup.Tests/         # xUnit unit & integration tests
 tools/
   build.ps1                # Publishes apilookup binary to csharp-definition-lookup/scripts/
 csharp-definition-lookup/
   SKILL.md                 # Skill guide for AI agents
   scripts/
     apilookup.exe          # Prebuilt Windows single-file CLI (framework-dependent)
-    TypeScanner.csx        # Legacy dotnet-script scanner
+    TypeScanner.csx        # Legacy dotnet-script scanner (deprecated)
 csharp-decompiler/
   SKILL.md                 # Skill guide for AI agents
 ```

@@ -1,3 +1,7 @@
+// DEPRECATED: Retained only for legacy compatibility.
+// Use `apilookup.exe` (or `dotnet run --project ../../src/ApiLookup`) instead — it provides
+// FTS5 + CamelCase/CJK search, inheritance trees, extension methods, XML docs, and auto-caching.
+
 using System;
 using System.Collections.Generic;
 using System.IO;
