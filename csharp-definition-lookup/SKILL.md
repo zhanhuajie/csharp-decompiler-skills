@@ -40,7 +40,15 @@ Every command accepts any combination of `--dir`, `--project`, `--dll`, or a pre
 
 ## Recommended Workflows
 
-### 1. Build a reusable SDK index once (best for Revit / AutoCAD / Plant 3D)
+### 1. Check existing indexes first (avoid redundant rebuilds across sessions)
+
+```powershell
+apilookup.exe index --list
+```
+
+Run `index --list` at the start of a session to discover already-built named indexes and their source paths in the default cache directory. Reuse a matching `--index <name>` instead of re-scanning directories or creating duplicate `auto-*.db` caches, and prefer `--name` in the default cache directory over custom `--db` paths so future sessions can always rediscover the index via `index --list`.
+
+### 2. Build a reusable SDK index once (best for Revit / AutoCAD / Plant 3D)
 
 ```powershell
 # AutoCAD + Plant 3D (filtered to Autodesk / PnP assemblies)
@@ -55,7 +63,7 @@ apilookup.exe index --name revit2026 `
   --dll "C:\Program Files\Autodesk\Revit 2026\RevitAPIUI.dll"
 ```
 
-### 2. Search when you don't know the exact class or method name
+### 3. Search when you don't know the exact class or method name
 
 ```powershell
 apilookup.exe search "offscreen device" --index acad2025
@@ -65,7 +73,7 @@ apilookup.exe search Asset --project C:\repo\MyApp\MyApp.csproj --ns Autodesk
 
 CamelCase identifiers are automatically tokenized (`CreateAutoCADOffScreenDevice` matches `"offscreen"`, `"off screen"`, `"autocad"`, `"device"`). Filter with `--kind type|method|property|enum|ctor`, `--ns <prefix>`, `--asm <fragment>`, `--limit <n>`.
 
-### 3. Inspect a type's clean C# API surface
+### 4. Inspect a type's clean C# API surface
 
 ```powershell
 # Filter members + include inherited base class / parent interface members
@@ -78,7 +86,7 @@ apilookup.exe show DocumentCollection --index acad2025 --ns Autodesk.AutoCAD --e
 apilookup.exe show Wall --index revit2026 --member Create --docs
 ```
 
-### 4. Explore inheritance & discover factory/helper methods
+### 5. Explore inheritance & discover factory/helper methods
 
 ```powershell
 # See all subclasses / implementers of Part (Pipe, Equipment, PipeInlineAsset, Connector, Support...)
