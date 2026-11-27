@@ -2,14 +2,14 @@
 
 [中文](README.zh-CN.md)
 
-A collection of agent-agnostic AI skills for C# assembly decompilation and symbol lookup. These skills help you analyze .NET assemblies, reverse-engineer business logic, and quickly locate types by namespace and assembly.
+A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/XML-doc lookup, and IL decompilation. Designed for analyzing closed-source SDKs (such as Revit, AutoCAD, Plant 3D, or NuGet packages) and reverse-engineering business logic.
 
 ## Skills
 
 | Skill | Description |
-|-------|-------------|
-| [csharp-decompiler](csharp-decompiler/SKILL.md) | Decompile .NET IL assemblies (`.dll`, `.exe`) to C# source code. Supports listing types, decompiling specific types, and full project export. |
-| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | Fast lookup of C# class definitions, namespaces, and assemblies from project references. Resolves NuGet packages via `project.assets.json`. |
+| --- | --- |
+| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | Offline .NET API indexer (`System.Reflection.Metadata` + SQLite FTS5). Full-text & CamelCase search across types, members, and XML docs; clean C# API skeletons with inherited members & extension methods; type hierarchy and reverse type lookup. |
+| [csharp-decompiler](csharp-decompiler/SKILL.md) | Decompile .NET IL assemblies (`.dll`, `.exe`) to C# source code via `ilspycmd`. Use when method bodies, internal side effects, or full project export are needed. |
 
 ---
 
@@ -17,110 +17,110 @@ A collection of agent-agnostic AI skills for C# assembly decompilation and symbo
 
 ### Prerequisites
 
-- [.NET SDK](https://dotnet.microsoft.com/download) installed
-- **ilspycmd** installed:
+- [.NET 8+ SDK / Runtime](https://dotnet.microsoft.com/download) installed
+- **ilspycmd** installed (for `csharp-decompiler`):
   ```bash
   dotnet tool install -g ilspycmd
   ```
-- **dotnet-script** installed (required for `csharp-definition-lookup`):
-  ```bash
-  dotnet tool install -g dotnet-script
-  ```
 
-### Verify Installation
+### Build / Publish `apilookup` (Optional — Windows binary is prebuilt)
 
-```bash
-dotnet --version
-ilspycmd --version
+```powershell
+# Build and publish framework-dependent single-file binary into csharp-definition-lookup/scripts/
+.\tools\build.ps1
+
+# Run unit tests
+dotnet test .\src\ApiLookup.Tests\ApiLookup.Tests.csproj -c Release
+```
+
+On Linux/macOS, invoke directly via `dotnet run --project src/ApiLookup -- <args>` or publish with `-r linux-x64` / `-r osx-arm64`.
+
+---
+
+## csharp-definition-lookup (`apilookup`)
+
+Powered by `System.Reflection.Metadata` + SQLite FTS5. Indexes managed assemblies (and companion `.xml` documentation files) into a fast local cache without loading DLLs or decompiling noisy IL.
+
+### Build a named SDK index
+
+```powershell
+# AutoCAD + Plant 3D (filter to Autodesk / PnP DLLs)
+.\csharp-definition-lookup\scripts\apilookup.exe index --name acad2025 --no-recursive `
+  --dir "C:\Program Files\Autodesk\AutoCAD 2025" `
+  --dir "C:\Program Files\Autodesk\AutoCAD 2025\PLNT3D" `
+  --include "ac*mgd.dll" --include "Ac*.dll" --include "Autodesk.*.dll" --include "PnP*.dll" --include "PnId*.dll"
+
+# Revit (automatically indexes RevitAPI.xml & RevitAPIUI.xml)
+.\csharp-definition-lookup\scripts\apilookup.exe index --name revit2026 `
+  --dll "C:\Program Files\Autodesk\Revit 2026\RevitAPI.dll" `
+  --dll "C:\Program Files\Autodesk\Revit 2026\RevitAPIUI.dll"
+```
+
+### Query examples
+
+```powershell
+# Full-text & CamelCase search across names and XML summaries
+apilookup.exe search "offscreen device" --index acad2025
+apilookup.exe search "create ceiling" --index revit2026
+
+# Clean C# skeleton with inherited members, extension methods, and XML docs
+apilookup.exe show DocumentCollection --index acad2025 --ns Autodesk.AutoCAD --ext --member Open
+apilookup.exe show Equipment --index acad2025 --ns Autodesk.ProcessPower.PnP3dObjects --member Port --inherited
+apilookup.exe show Wall --index revit2026 --member Create --docs
+
+# Type hierarchy & reverse type lookup
+apilookup.exe hierarchy Autodesk.ProcessPower.PnP3dObjects.Part --index acad2025
+apilookup.exe by-type DataLinksManager3d --index acad2025
+
+# Ad-hoc search against a .csproj (auto-cached by fingerprint)
+apilookup.exe search Asset --project C:\repo\MyApp\MyApp.csproj --list-refs
 ```
 
 ---
 
-## csharp-decompiler
+## csharp-decompiler (`ilspycmd`)
 
-Decompile .NET assemblies to C# source code using `ilspycmd`.
+Use when signatures and XML docs aren't enough and you need the actual method implementation:
 
-### List all types in an assembly
-
-```bash
-ilspycmd -l s <assembly_path>
-```
-
-### Decompile a specific type
-
-**Windows (PowerShell):**
 ```powershell
-ilspycmd -t <FullNamespace.ClassName> <assembly_path> 2>&1 > C:\temp\MyType.cs
-```
+# Windows (PowerShell — ilspycmd writes to stderr, always redirect to a file)
+ilspycmd -t <FullNamespace.ClassName> <assembly_path> 2>&1 > "$env:TEMP\MyType.cs"
 
-**Linux/macOS:**
-```bash
-ilspycmd -t <FullNamespace.ClassName> <assembly_path> > /tmp/MyType.cs 2>&1
-```
-
-> For nested classes, use `+` notation: `Namespace.OuterClass+InnerClass`
-
-> **Note**: `ilspycmd` writes to stderr. Always use file redirection (`2>&1 >`) and read the output file — do not rely on terminal output.
-
-### Export the full project
-
-```bash
+# Full project export
 ilspycmd -p -o <output_directory> <assembly_path>
 ```
 
 ---
 
-## csharp-definition-lookup
-
-Locate a type's namespace and DLL path from project references (`.csproj` / NuGet).
-
-### Basic usage
-
-```powershell
-dotnet script csharp-definition-lookup/scripts/TypeScanner.csx -- <SymbolName> --project <PathToCsproj>
-```
-
-### List all resolved references
-
-```powershell
-dotnet script csharp-definition-lookup/scripts/TypeScanner.csx -- <SymbolName> --project <PathToCsproj> --list-refs
-```
-
-### Additional options
-
-| Option | Description |
-|--------|-------------|
-| `--namespace <prefix>` | Filter results by namespace prefix (e.g., `Autodesk`). |
-| `--dll <path>` | Search a specific DLL directly instead of resolving from `.csproj`. |
-
-> Run `dotnet restore` first to generate `obj/project.assets.json` for NuGet resolution.
-
----
-
 ## Recommended Workflow
 
-```
-Unknown type location
+```text
+Need API / type / usage
         │
         ▼
-csharp-definition-lookup   ──►  Outputs: full namespace + DLL path
-        │
-        ▼
-csharp-decompiler           ──►  Outputs: full C# source / project structure
+csharp-definition-lookup (apilookup)  ──►  FTS5 search, C# skeleton, XML docs,
+        │                                  inheritance, extensions, exact DLL path
+        ▼ (only when method body / internal side effects matter)
+csharp-decompiler (ilspycmd)          ──►  Full C# decompiled implementation
 ```
 
 ---
 
 ## Repository Structure
 
-```
-csharp-decompiler/
-  SKILL.md               # Skill description and usage (loaded by AI agents)
-
+```text
+src/
+  ApiLookup/               # .NET 8 CLI (System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5)
+  ApiLookup.Tests/         # xUnit tests
+tools/
+  build.ps1                # Publishes apilookup binary to csharp-definition-lookup/scripts/
 csharp-definition-lookup/
-  SKILL.md               # Skill description and usage (loaded by AI agents)
+  SKILL.md                 # Skill guide for AI agents
   scripts/
-    TypeScanner.csx      # Complete lookup tool (resolves references + scans PE metadata)
+    apilookup.exe          # Prebuilt Windows single-file CLI (framework-dependent)
+    TypeScanner.csx        # Legacy dotnet-script scanner
+csharp-decompiler/
+  SKILL.md                 # Skill guide for AI agents
 ```
 
 ---

@@ -1,11 +1,13 @@
 ---
 name: csharp-decompiler
-description: Decompile .NET IL-based assemblies (.dll, .exe) to C# source code. Use when analyzing C# binaries, reverse engineering logic, or exporting complete projects from compiled files. Supports listing types, decompiling specific classes, and full project export. If you cannot confirm which DLL contains the target type, use the `csharp-definition-lookup` skill first to locate the exact assembly.
+description: Decompile .NET IL-based assemblies (.dll, .exe) to C# source code. Use when you need method bodies, internal logic, hidden side effects, or full project export from compiled files. For checking type locations, clean C# signatures, XML docs, inheritance, or extension methods, use the faster `csharp-definition-lookup` skill first.
 ---
 
 # C# Decompiler
 
 Expert tool for reverse engineering .NET assemblies using `ilspycmd`.
+
+> **Prefer `csharp-definition-lookup` first**: For locating DLLs/namespaces, inspecting public API signatures, XML documentation, inherited members, extension methods, or type hierarchies, use `csharp-definition-lookup` (`apilookup.exe`) first — it is instant and avoids C++/CLI IL noise. Use `csharp-decompiler` (`ilspycmd`) when you need actual **method bodies / internal implementation details** (and reuse the exact `CLR Name` + `Assembly` path printed by `apilookup show`).
 
 ## Prerequisites
 
