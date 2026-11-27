@@ -122,11 +122,11 @@ Directory.Build.props
 .github/workflows/ci.yml
 src/
   ApiLookup/               # .NET 8 CLI（System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5）
-    Cli/                   # 命令行参数定义
+    Cli/                   # 命令目录（各命令允许的选项与参数个数）、解析器、命令处理、帮助与版本信息
     Extraction/            # PE 元数据、常量/可空特性、类型名/签名解码、中英文分词与工程源解析
     Formatting/            # 文本/JSON 输出格式化与统一 camelCase 源生成序列化上下文
-    Models/                # 元数据与查询结果数据模型
-    Storage/               # 缓存目录管理、流式异步建库与索引化 SQLite 查询
+    Models/                # 元数据与查询结果数据模型、常用类型名与种类常量
+    Storage/               # 表结构定义、行读取器、缓存目录管理、流式异步建库与 SQLite 查询
   ApiLookup.Tests/         # xUnit 单元测试与集成测试
 tools/
   build.ps1                # 发布 apilookup 到 csharp-definition-lookup/scripts/

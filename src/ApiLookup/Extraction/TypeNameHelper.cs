@@ -353,7 +353,7 @@ internal static class TypeNameHelper
                     var constraint = md.GetGenericParameterConstraint(ch);
                     var cFull = StripGenerics(ResolveEntityFullName(md, constraint.Type, fullCtx));
                     if (string.IsNullOrEmpty(cFull) ||
-                        cFull is "System.ValueType" or "ValueType" or "System.Object" or "object" ||
+                        cFull is WellKnownTypes.ValueType or "ValueType" or WellKnownTypes.Object or "object" ||
                         IsGenericParamName(cFull, fullCtx))
                         continue;
                     var cSimple = ExtractSimpleTypeName(cFull);
@@ -362,8 +362,8 @@ internal static class TypeNameHelper
                 }
 
                 // Preserve `where T : struct` when combined with concrete constraints (e.g. `where T : struct, ISampleItem`).
-                if (isValueTypeConstraint && targets.Count > 0 && seen.Add("System.ValueType"))
-                    targets.Add(new ExtensionTargetRef("System.ValueType", "ValueType"));
+                if (isValueTypeConstraint && targets.Count > 0 && seen.Add(WellKnownTypes.ValueType))
+                    targets.Add(new ExtensionTargetRef(WellKnownTypes.ValueType, "ValueType"));
             }
             return targets;
         }

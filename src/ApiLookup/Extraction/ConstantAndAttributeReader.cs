@@ -142,8 +142,8 @@ internal static class ConstantAndAttributeReader
             var (_, _, _, bareFull, _, simpleName) = TypeNameHelper.BuildTypeNames(md, td);
             var isInterface = (td.Attributes & TypeAttributes.Interface) != 0;
             var baseFull = td.BaseType.IsNil ? null : TypeNameHelper.ResolveEntityFullName(md, td.BaseType, GenericContext.Empty);
-            var isEnum = !isInterface && baseFull == "System.Enum";
-            var isStruct = !isInterface && baseFull == "System.ValueType";
+            var isEnum = !isInterface && baseFull == WellKnownTypes.Enum;
+            var isStruct = !isInterface && baseFull == WellKnownTypes.ValueType;
 
             refTypes.RegisterType(bareFull, simpleName, isValueType: isEnum || isStruct);
 

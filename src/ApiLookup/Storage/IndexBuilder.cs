@@ -7,8 +7,6 @@ namespace ApiLookup;
 
 public static class IndexBuilder
 {
-    public const string SchemaVersion = "4";
-
     public static (IndexStore Store, IndexStats Stats) EnsureBuilt(
         string dbPath,
         string? indexName,
@@ -23,7 +21,7 @@ public static class IndexBuilder
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
 
-        var effectiveFingerprint = $"{SchemaVersion}|{(includeNonPublic ? "all" : "pub")}|{sources.Fingerprint}";
+        var effectiveFingerprint = $"{IndexSchema.Version}|{(includeNonPublic ? "all" : "pub")}|{sources.Fingerprint}";
 
         if (!forceRebuild && TryOpenMatching(dbPath, effectiveFingerprint, out var fastStore))
         {
@@ -164,7 +162,7 @@ ANALYZE;
         {
             candidate = IndexStore.OpenReadOnly(dbPath);
             if (candidate.GetMeta("fingerprint") == expectedFingerprint &&
-                candidate.GetMeta("schema_version") == SchemaVersion)
+                candidate.GetMeta("schema_version") == IndexSchema.Version)
             {
                 store = candidate;
                 candidate = null; // ownership transferred to caller
@@ -183,135 +181,9 @@ ANALYZE;
         return false;
     }
 
-    private static void CreateTables(SqliteConnection conn)
-    {
-        ExecuteNonQuery(conn, @"
-CREATE TABLE meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
+    private static void CreateTables(SqliteConnection conn) => ExecuteNonQuery(conn, IndexSchema.CreateTablesSql);
 
-CREATE TABLE assemblies (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL COLLATE NOCASE,
-    path TEXT NOT NULL,
-    version TEXT NOT NULL,
-    xml_path TEXT,
-    file_size INTEGER NOT NULL,
-    mtime_utc INTEGER NOT NULL,
-    type_count INTEGER NOT NULL
-);
-
-CREATE TABLE types (
-    id INTEGER PRIMARY KEY,
-    assembly_id INTEGER NOT NULL,
-    full_name TEXT NOT NULL COLLATE NOCASE,
-    bare_full_name TEXT NOT NULL COLLATE NOCASE,
-    clr_name TEXT NOT NULL COLLATE NOCASE,
-    namespace TEXT NOT NULL COLLATE NOCASE,
-    name TEXT NOT NULL COLLATE NOCASE,
-    simple_name TEXT NOT NULL COLLATE NOCASE,
-    kind TEXT NOT NULL COLLATE NOCASE,
-    accessibility TEXT NOT NULL,
-    modifiers TEXT NOT NULL,
-    base_type TEXT COLLATE NOCASE,
-    base_bare TEXT COLLATE NOCASE,
-    base_simple TEXT COLLATE NOCASE,
-    interfaces TEXT NOT NULL,
-    generic_params TEXT NOT NULL,
-    generic_constraints TEXT NOT NULL,
-    delegate_signature TEXT,
-    is_extension_container INTEGER NOT NULL,
-    summary TEXT,
-    remarks TEXT,
-    doc_id TEXT NOT NULL
-);
-
-CREATE TABLE type_interfaces (
-    type_id INTEGER NOT NULL,
-    iface_full TEXT NOT NULL COLLATE NOCASE,
-    iface_simple TEXT NOT NULL COLLATE NOCASE
-);
-
-CREATE TABLE members (
-    id INTEGER PRIMARY KEY,
-    type_id INTEGER NOT NULL,
-    assembly_id INTEGER NOT NULL,
-    kind TEXT NOT NULL COLLATE NOCASE,
-    name TEXT NOT NULL COLLATE NOCASE,
-    accessibility TEXT NOT NULL,
-    modifiers TEXT NOT NULL,
-    return_type TEXT NOT NULL,
-    return_simple TEXT NOT NULL COLLATE NOCASE,
-    signature TEXT NOT NULL,
-    param_types TEXT NOT NULL,
-    ext_target_type TEXT COLLATE NOCASE,
-    ext_target_simple TEXT COLLATE NOCASE,
-    enum_value TEXT,
-    summary TEXT,
-    params_doc TEXT,
-    returns_doc TEXT,
-    doc_id TEXT NOT NULL
-);
-
-CREATE TABLE extension_targets (
-    member_id INTEGER NOT NULL,
-    target_full TEXT NOT NULL COLLATE NOCASE,
-    target_simple TEXT NOT NULL COLLATE NOCASE
-);
-
-CREATE TABLE member_type_refs (
-    member_id INTEGER NOT NULL,
-    type_full TEXT NOT NULL COLLATE NOCASE,
-    type_simple TEXT NOT NULL COLLATE NOCASE,
-    role TEXT NOT NULL
-);
-
-CREATE VIRTUAL TABLE fts_entries USING fts5(
-    entity_type UNINDEXED,
-    entity_id UNINDEXED,
-    kind UNINDEXED,
-    assembly_name UNINDEXED,
-    namespace UNINDEXED,
-    full_name,
-    name,
-    tokens,
-    summary,
-    tokenize = 'unicode61'
-);
-");
-    }
-
-    private static void CreateIndexes(SqliteConnection conn)
-    {
-        ExecuteNonQuery(conn, @"
-CREATE INDEX idx_types_full_name ON types(full_name);
-CREATE INDEX idx_types_bare_full_name ON types(bare_full_name);
-CREATE INDEX idx_types_clr_name ON types(clr_name);
-CREATE INDEX idx_types_simple_name ON types(simple_name);
-CREATE INDEX idx_types_name ON types(name);
-CREATE INDEX idx_types_base_type ON types(base_type);
-CREATE INDEX idx_types_base_bare ON types(base_bare);
-CREATE INDEX idx_types_base_simple ON types(base_simple);
-CREATE INDEX idx_types_namespace ON types(namespace);
-CREATE INDEX idx_types_assembly_id ON types(assembly_id);
-
-CREATE INDEX idx_type_interfaces_type_id ON type_interfaces(type_id);
-CREATE INDEX idx_type_interfaces_full ON type_interfaces(iface_full);
-CREATE INDEX idx_type_interfaces_simple ON type_interfaces(iface_simple);
-
-CREATE INDEX idx_members_type_id ON members(type_id);
-CREATE INDEX idx_members_name ON members(name);
-CREATE INDEX idx_members_ext_target ON members(ext_target_type);
-CREATE INDEX idx_members_ext_simple ON members(ext_target_simple);
-
-CREATE INDEX idx_extension_targets_lookup ON extension_targets(target_simple, target_full, member_id);
-CREATE INDEX idx_extension_targets_member ON extension_targets(member_id);
-
-CREATE INDEX idx_member_type_refs_lookup ON member_type_refs(type_simple, role, member_id);
-CREATE INDEX idx_member_type_refs_full ON member_type_refs(type_full, role, member_id);
-");
-    }
+    private static void CreateIndexes(SqliteConnection conn) => ExecuteNonQuery(conn, IndexSchema.CreateIndexesSql);
 
     private static void InsertFromChannel(
         SqliteConnection conn,
@@ -334,7 +206,7 @@ CREATE INDEX idx_member_type_refs_full ON member_type_refs(type_full, role, memb
             metaCmd.ExecuteNonQuery();
         }
 
-        PutMeta("schema_version", SchemaVersion);
+        PutMeta("schema_version", IndexSchema.Version);
         PutMeta("fingerprint", fingerprint);
         PutMeta("built_at_utc", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
         PutMeta("sources", sourceDescription);
@@ -509,7 +381,7 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                     if (tCjk.Length > 0)
                         tTokens = string.IsNullOrEmpty(tTokens) ? tCjk : $"{tTokens} {tCjk}";
 
-                    pFEt.Value = "type";
+                    pFEt.Value = EntityTypes.Type;
                     pFEid.Value = typeId;
                     pFKind.Value = t.Kind;
                     pFAname.Value = asm.Name;
@@ -561,7 +433,7 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         }
 
                         // Skip indexing trivial parameterless constructors in FTS5 (already covered by the type entry)
-                        if (m.Kind == "ctor" && string.IsNullOrEmpty(m.ParamTypes))
+                        if (m.Kind == MemberKinds.Constructor && string.IsNullOrEmpty(m.ParamTypes))
                             continue;
 
                         var mTokens = Tokenizer.BuildSearchTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes);
@@ -569,7 +441,7 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         if (mCjk.Length > 0)
                             mTokens = string.IsNullOrEmpty(mTokens) ? mCjk : $"{mTokens} {mCjk}";
 
-                        pFEt.Value = "member";
+                        pFEt.Value = EntityTypes.Member;
                         pFEid.Value = memId;
                         pFKind.Value = m.Kind;
                         pFAname.Value = asm.Name;

@@ -188,15 +188,15 @@ public class MetadataExtractorTests
     [Fact]
     public void ExtractReferencedSimpleTypeNames_HandlesGenericsMultiDimArraysAndPrimitiveAliases()
     {
-        var refs1 = MetadataExtractor.ExtractReferencedSimpleTypeNames("IDictionary<string, IList<SamplePipeSegment[,,]>>");
+        var refs1 = TypeNameHelper.ExtractReferencedSimpleTypeNames("IDictionary<string, IList<SamplePipeSegment[,,]>>");
         Assert.Contains("IDictionary", refs1);
         Assert.Contains("string", refs1);
         Assert.Contains("IList", refs1);
         Assert.Contains("SamplePipeSegment", refs1);
 
-        Assert.Equal("string", MetadataExtractor.ExtractSimpleTypeName("System.String"));
-        Assert.Equal("int", MetadataExtractor.ExtractSimpleTypeName("System.Int32[]"));
-        Assert.Equal("Inner", MetadataExtractor.ExtractSimpleTypeName("Ns.Outer<int>.Inner<string>"));
+        Assert.Equal("string", TypeNameHelper.ExtractSimpleTypeName("System.String"));
+        Assert.Equal("int", TypeNameHelper.ExtractSimpleTypeName("System.Int32[]"));
+        Assert.Equal("Inner", TypeNameHelper.ExtractSimpleTypeName("Ns.Outer<int>.Inner<string>"));
 
         Assert.Equal("List<string>", TypeNameHelper.ShortenDisplayType("System.Collections.Generic.List<System.String>"));
         Assert.Equal("SampleContainer<SamplePipeSegment>", TypeNameHelper.ShortenDisplayType("ApiLookup.Tests.Fixtures.SampleContainer<ApiLookup.Tests.Fixtures.SamplePipeSegment>"));

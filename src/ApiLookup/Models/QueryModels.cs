@@ -35,6 +35,21 @@ public sealed record SearchHit(
     string? Summary,
     double Score);
 
+/// <summary>
+/// Raw full-text match returned by <see cref="IndexStore.Search"/>, in rank order. Exactly one of
+/// <see cref="Type"/> / <see cref="Member"/> is set; <see cref="OutputFormatter.ToSearchHits"/> turns it into a <see cref="SearchHit"/>.
+/// </summary>
+public sealed record SearchResult(
+    string EntityType,
+    long EntityId,
+    double Score,
+    string Namespace,
+    TypeRow? Type,
+    MemberRow? Member)
+{
+    public string Name => Type?.Name ?? Member?.Name ?? string.Empty;
+}
+
 public sealed record TypeRow(
     long Id,
     string AssemblyName,

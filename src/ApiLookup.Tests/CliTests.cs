@@ -33,15 +33,15 @@ public class CliTests : IDisposable
     [Fact]
     public void ParseArgs_SupportsFlagsBeforeCommandLimit30AndValidation()
     {
-        var opts = Program.ParseArgs(new[] { "--json", "--limit", "30", "hierarchy", "SampleBaseEntity", "--tfm", "net8.0" });
+        var opts = CliParser.Parse(new[] { "--json", "--limit", "30", "hierarchy", "SampleBaseEntity", "--tfm", "net8.0" });
         Assert.True(opts.Json);
         Assert.Equal(30, opts.Limit);
         Assert.Equal("hierarchy", opts.Command);
         Assert.Equal(new[] { "SampleBaseEntity" }, opts.Positional);
         Assert.Equal("net8.0", opts.TargetFramework);
 
-        Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "by-type", "Wall", "--role", "invalid" }));
-        Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "search", "Wall", "--kind", "invalid" }));
+        Assert.Throws<ArgumentException>(() => CliParser.Parse(new[] { "by-type", "Wall", "--role", "invalid" }));
+        Assert.Throws<ArgumentException>(() => CliParser.Parse(new[] { "search", "Wall", "--kind", "invalid" }));
     }
 
     [Fact]

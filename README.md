@@ -122,11 +122,11 @@ Directory.Build.props
 .github/workflows/ci.yml
 src/
   ApiLookup/               # .NET 8 CLI (System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5)
-    Cli/                   # CLI option model
+    Cli/                   # Command catalog (options/arity per command), parser, handlers, help & build info
     Extraction/            # Metadata, constants/nullability, signature decoder, tokenizer & source resolver
     Formatting/            # Text/JSON formatters + camelCase System.Text.Json source-gen context
-    Models/                # Extracted & query DTO records
-    Storage/               # Index catalog, async streaming builder, indexed SQLite query store
+    Models/                # Extracted & query DTO records, well-known names and kind constants
+    Storage/               # Schema, row readers, index catalog, async streaming builder, SQLite query store
   ApiLookup.Tests/         # xUnit unit & integration tests
 tools/
   build.ps1                # Publishes apilookup binary to csharp-definition-lookup/scripts/

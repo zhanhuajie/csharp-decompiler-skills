@@ -95,7 +95,7 @@ public class RegressionTests : IDisposable
     [InlineData("pipe-segment-kind")]
     public void SearchShorthand_StillWorksForSymbolNames(string word)
     {
-        var opts = Program.ParseArgs(new[] { word, "--db", "x.db" });
+        var opts = CliParser.Parse(new[] { word, "--db", "x.db" });
         Assert.Equal("search", opts.Command);
         Assert.Equal(new[] { word }, opts.Positional);
     }
@@ -103,9 +103,9 @@ public class RegressionTests : IDisposable
     [Fact]
     public void EditDistance_CountsTranspositionAsSingleEdit()
     {
-        Assert.Equal(1, Program.EditDistance("serach", "search"));
-        Assert.Equal(1, Program.EditDistance("hierachy", "hierarchy"));
-        Assert.Null(Program.SuggestClosest("offscreen", new[] { "search", "show", "index" }));
+        Assert.Equal(1, CliParser.EditDistance("serach", "search"));
+        Assert.Equal(1, CliParser.EditDistance("hierachy", "hierarchy"));
+        Assert.Null(CliParser.SuggestClosest("offscreen", new[] { "search", "show", "index" }));
     }
 
     // ---- Per-command option validation ----
@@ -124,7 +124,7 @@ public class RegressionTests : IDisposable
     [InlineData("refs", "extra")]
     [InlineData("search", "Wall", "--namspace", "Autodesk")]
     public void InvalidOptionUsage_IsRejected(params string[] args)
-        => Assert.Throws<ArgumentException>(() => Program.ParseArgs(args));
+        => Assert.Throws<ArgumentException>(() => CliParser.Parse(args));
 
     [Theory]
     [InlineData("by-type", "Wall", "--role", "return", "--ns", "Autodesk", "--limit", "5")]
@@ -136,15 +136,15 @@ public class RegressionTests : IDisposable
     [InlineData("show", "--help", "--limit", "3")]  // help short-circuits validation
     [InlineData("--version", "--verbose")]
     public void ValidOptionUsage_IsAccepted(params string[] args)
-        => Program.ParseArgs(args);
+        => CliParser.Parse(args);
 
     [Fact]
     public void InvalidOptionUsage_MessagesAreActionable()
     {
-        var notValid = Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "search", "Wall", "--role", "return" }));
+        var notValid = Assert.Throws<ArgumentException>(() => CliParser.Parse(new[] { "search", "Wall", "--role", "return" }));
         Assert.Contains("Option '--role' is not valid for 'search'", notValid.Message);
 
-        var unknown = Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "search", "Wall", "--namspace", "A" }));
+        var unknown = Assert.Throws<ArgumentException>(() => CliParser.Parse(new[] { "search", "Wall", "--namspace", "A" }));
         Assert.Contains("Did you mean '--namespace'?", unknown.Message);
     }
 
@@ -171,7 +171,7 @@ public class RegressionTests : IDisposable
     [Fact]
     public void VersionVerbose_PrintsEmbeddedSourceHash()
     {
-        var hash = Program.GetSourceHash();
+        var hash = BuildInfo.GetSourceHash();
         Assert.NotNull(hash);
         Assert.Matches("^[0-9a-f]{16}$", hash);
 

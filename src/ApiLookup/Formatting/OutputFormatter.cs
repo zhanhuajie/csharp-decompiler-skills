@@ -27,7 +27,7 @@ public static class OutputFormatter
         parts.Add(t.Name);
 
         var bases = new List<string>();
-        if (t.BaseType is not ("System.Object" or "System.ValueType" or "System.Enum" or "System.MulticastDelegate" or "System.Delegate"))
+        if (!WellKnownTypes.IsImplicitBase(t.BaseType))
         {
             var baseDisplay = !string.IsNullOrEmpty(t.BaseType)
                 ? TypeNameHelper.ShortenDisplayType(t.BaseType)
@@ -46,6 +46,26 @@ public static class OutputFormatter
             header = $"{header} {t.GenericConstraints}";
 
         return header;
+    }
+
+    /// <summary>Projects raw store matches into the public <see cref="SearchHit"/> contract (text and JSON output).</summary>
+    public static IReadOnlyList<SearchHit> ToSearchHits(IReadOnlyList<SearchResult> results)
+    {
+        var hits = new List<SearchHit>(results.Count);
+        foreach (var r in results)
+        {
+            if (r.Type is { } t)
+            {
+                hits.Add(new SearchHit(EntityTypes.Type, r.EntityId, t.Kind, t.AssemblyName, t.AssemblyPath,
+                    t.Namespace, t.FullName, t.Name, FormatTypeHeader(t), t.Summary, r.Score));
+            }
+            else if (r.Member is { } m)
+            {
+                hits.Add(new SearchHit(EntityTypes.Member, r.EntityId, m.Kind, m.AssemblyName, m.AssemblyPath,
+                    r.Namespace, $"{m.DeclaringFullName}.{m.Name}", m.Name, m.Signature, m.Summary, r.Score));
+            }
+        }
+        return hits;
     }
 
     public static void WriteIndexStats(IndexStats stats, bool json, TextWriter? output = null)
@@ -208,7 +228,7 @@ public static class OutputFormatter
         if (showFullDocs && !string.IsNullOrEmpty(type.Remarks))
             sb.AppendLine($"/// Remarks: {type.Remarks}");
 
-        if (type.Kind == "delegate" && !string.IsNullOrEmpty(type.DelegateSignature) && !memberFiltered)
+        if (type.Kind == TypeKinds.Delegate && !string.IsNullOrEmpty(type.DelegateSignature) && !memberFiltered)
         {
             sb.AppendLine($"{type.DelegateSignature};");
             if (extensionMethods.Count > 0)
@@ -264,12 +284,12 @@ public static class OutputFormatter
         {
             var section = m.Kind switch
             {
-                "enum" => "Values",
-                "ctor" => "Constructors",
-                "property" => "Properties",
-                "method" => "Methods",
-                "event" => "Events",
-                "field" => "Fields",
+                MemberKinds.EnumValue => "Values",
+                MemberKinds.Constructor => "Constructors",
+                MemberKinds.Property => "Properties",
+                MemberKinds.Method => "Methods",
+                MemberKinds.Event => "Events",
+                MemberKinds.Field => "Fields",
                 _ => "Members",
             };
             if (section != lastSection)
@@ -284,8 +304,8 @@ public static class OutputFormatter
 
             var suffix = m.Kind switch
             {
-                "enum" => ",",
-                "property" => "",
+                MemberKinds.EnumValue => ",",
+                MemberKinds.Property => "",
                 _ => ";",
             };
             sb.AppendLine($"{indent}{m.Signature}{suffix}");
