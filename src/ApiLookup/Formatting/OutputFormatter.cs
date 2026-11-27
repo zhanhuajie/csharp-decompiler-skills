@@ -27,9 +27,14 @@ public static class OutputFormatter
         parts.Add(t.Name);
 
         var bases = new List<string>();
-        if (!string.IsNullOrEmpty(t.BaseSimple) &&
-            t.BaseType is not ("System.Object" or "System.ValueType" or "System.Enum" or "System.MulticastDelegate" or "System.Delegate"))
-            bases.Add(t.BaseSimple);
+        if (t.BaseType is not ("System.Object" or "System.ValueType" or "System.Enum" or "System.MulticastDelegate" or "System.Delegate"))
+        {
+            var baseDisplay = !string.IsNullOrEmpty(t.BaseType)
+                ? TypeNameHelper.ShortenDisplayType(t.BaseType)
+                : t.BaseSimple;
+            if (!string.IsNullOrEmpty(baseDisplay))
+                bases.Add(baseDisplay);
+        }
         if (!string.IsNullOrEmpty(t.Interfaces))
             bases.Add(t.Interfaces);
 
@@ -320,7 +325,10 @@ public static class OutputFormatter
         }
         foreach (var d in result.DerivedTypes)
         {
-            var via = !string.IsNullOrEmpty(d.BaseSimple) ? $" : {d.BaseSimple}" : "";
+            var baseDisplay = !string.IsNullOrEmpty(d.BaseType)
+                ? TypeNameHelper.ShortenDisplayType(d.BaseType)
+                : d.BaseSimple;
+            var via = !string.IsNullOrEmpty(baseDisplay) ? $" : {baseDisplay}" : "";
             w.WriteLine($"  [{d.Kind,-9}] {d.FullName}{via}  ({d.AssemblyName})");
         }
     }

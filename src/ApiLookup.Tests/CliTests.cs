@@ -95,6 +95,11 @@ public class CliTests : IDisposable
         Assert.Contains("public delegate bool SampleFilterHandler(SampleBaseEntity entity, int depth);", delText);
         Assert.DoesNotContain("BeginInvoke", delText);
 
+        // 6b. show class deriving from constructed generic base preserves generic arguments
+        var genericBaseOut = new StringWriter();
+        Assert.Equal(0, Program.Run(new[] { "show", "SamplePipeContainer", "--db", dbPath }, genericBaseOut, new StringWriter()));
+        Assert.Contains("public class SamplePipeContainer : SampleContainer<SamplePipeSegment>", genericBaseOut.ToString());
+
         // 7. --json error contract: missing type or invalid flag emits valid ErrorJsonResult to stdout with exit code 1
         var missingOut = new StringWriter();
         Assert.Equal(1, Program.Run(new[] { "show", "DefinitelyMissingTypeXyz", "--db", dbPath, "--json" }, missingOut, new StringWriter()));

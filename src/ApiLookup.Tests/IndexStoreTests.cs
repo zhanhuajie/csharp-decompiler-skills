@@ -123,7 +123,44 @@ public class IndexStoreTests : IDisposable
         var exts = store.GetExtensionMethods(pipe, chain);
         Assert.Contains(exts, e => e.Name == "CreateAutoCADOffScreenDeviceSnapshot");
         Assert.Contains(exts, e => e.Name == "UpgradeEntityOpen");
+        Assert.Contains(exts, e => e.Name == "UpgradeDisposableEntity");
+        Assert.DoesNotContain(exts, e => e.Name == "UpgradeTaggedEntity");
         Assert.DoesNotContain(exts, e => e.Name == "CountSegmentArray");
+
+        // Multi-constraint extension conjunction checks across base, interface, tagged class, struct, and nested generic host
+        var baseEntity = store.ResolveType("SampleBaseEntity").Single();
+        var baseExts = store.GetExtensionMethods(baseEntity, store.GetBaseTypeChain(baseEntity));
+        Assert.Contains(baseExts, e => e.Name == "UpgradeEntityOpen");
+        Assert.DoesNotContain(baseExts, e => e.Name == "UpgradeTaggedEntity");
+        Assert.DoesNotContain(baseExts, e => e.Name == "UpgradeDisposableEntity");
+
+        var taggedPipe = store.ResolveType("SampleTaggedPipe").Single();
+        var taggedPipeExts = store.GetExtensionMethods(taggedPipe, store.GetBaseTypeChain(taggedPipe));
+        Assert.Contains(taggedPipeExts, e => e.Name == "UpgradeEntityOpen");
+        Assert.Contains(taggedPipeExts, e => e.Name == "UpgradeTaggedEntity");
+        Assert.DoesNotContain(taggedPipeExts, e => e.Name == "UpgradeDisposableEntity");
+        Assert.DoesNotContain(taggedPipeExts, e => e.Name == "FormatTaggedStruct");
+
+        var taggedStruct = store.ResolveType("SampleTaggedStruct").Single();
+        var taggedStructExts = store.GetExtensionMethods(taggedStruct, store.GetBaseTypeChain(taggedStruct));
+        Assert.Contains(taggedStructExts, e => e.Name == "FormatTaggedStruct");
+        Assert.Contains(taggedStructExts, e => e.Name == "GetFixtureTag");
+        Assert.DoesNotContain(taggedStructExts, e => e.Name == "UpgradeTaggedEntity");
+
+        var innerToken = store.ResolveType("InnerToken").Single();
+        var innerTokenExts = store.GetExtensionMethods(innerToken, store.GetBaseTypeChain(innerToken));
+        Assert.Contains(innerTokenExts, e => e.Name == "DescribeInnerToken");
+
+        // Generic base-class formatting preserves generic arguments in FormatTypeHeader & Search
+        var pipeContainer = store.ResolveType("SamplePipeContainer").Single();
+        Assert.Equal("public class SamplePipeContainer : SampleContainer<SamplePipeSegment>", OutputFormatter.FormatTypeHeader(pipeContainer));
+        var pipeContainerHit = store.Search("SamplePipeContainer", kindFilter: "type").Single(h => h.Name == "SamplePipeContainer");
+        Assert.Contains(": SampleContainer<SamplePipeSegment>", pipeContainerHit.Signature);
+
+        var stringList = store.ResolveType("SampleStringList").Single();
+        Assert.Equal("public class SampleStringList : List<string>", OutputFormatter.FormatTypeHeader(stringList));
+        var stringListHit = store.Search("SampleStringList", kindFilter: "type").Single(h => h.Name == "SampleStringList");
+        Assert.Contains(": List<string>", stringListHit.Signature);
 
         // Interface inheritance chain: IDerivedSampleItem -> ISampleItem
         var derivedIface = store.ResolveType("IDerivedSampleItem").Single();
@@ -150,6 +187,8 @@ public class IndexStoreTests : IDisposable
         var implExts = store.GetExtensionMethods(impl, implChain);
         Assert.Contains(implExts, e => e.Name == "CountPipeEntries");
         Assert.DoesNotContain(implExts, e => e.Name == "GetOtherTag");
+        Assert.DoesNotContain(implExts, e => e.Name == "UpgradeTaggedEntity");
+        Assert.DoesNotContain(implExts, e => e.Name == "FormatTaggedStruct");
 
         // Reverse lookup by-type finds generic containers, multi-dim arrays, primitive aliases, AND disambiguates qualified namespaces
         var producers = store.FindByType("SamplePipeSegment", role: "return");
@@ -201,6 +240,11 @@ public class IndexStoreTests : IDisposable
             "SELECT member_id FROM extension_targets WHERE target_simple IN ($s0)",
             ("$s0", "SampleBaseEntity"));
         Assert.DoesNotContain(planExt, p => p.StartsWith("SCAN extension_targets", StringComparison.OrdinalIgnoreCase));
+
+        var planExtByMember = store.ExplainQueryPlan(
+            "SELECT member_id, target_full, target_simple FROM extension_targets WHERE member_id IN ($m0)",
+            ("$m0", 1L));
+        Assert.DoesNotContain(planExtByMember, p => p.StartsWith("SCAN extension_targets", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

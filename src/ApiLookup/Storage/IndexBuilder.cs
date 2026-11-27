@@ -7,7 +7,7 @@ namespace ApiLookup;
 
 public static class IndexBuilder
 {
-    public const string SchemaVersion = "3";
+    public const string SchemaVersion = "4";
 
     public static (IndexStore Store, IndexStats Stats) EnsureBuilt(
         string dbPath,
@@ -264,6 +264,7 @@ CREATE INDEX idx_members_ext_target ON members(ext_target_type);
 CREATE INDEX idx_members_ext_simple ON members(ext_target_simple);
 
 CREATE INDEX idx_extension_targets_lookup ON extension_targets(target_simple, target_full, member_id);
+CREATE INDEX idx_extension_targets_member ON extension_targets(member_id);
 
 CREATE INDEX idx_member_type_refs_lookup ON member_type_refs(type_simple, role, member_id);
 CREATE INDEX idx_member_type_refs_full ON member_type_refs(type_full, role, member_id);

@@ -118,6 +118,63 @@ namespace ApiLookup.Tests.Fixtures
         /// <summary>Array-only extension that must NOT appear on a single SamplePipeSegment.</summary>
         public static int CountSegmentArray(this SamplePipeSegment[] segments)
             => segments.Length;
+
+        /// <summary>Extension requiring both SampleBaseEntity and ISampleItem.</summary>
+        public static T UpgradeTaggedEntity<T>(this T entity) where T : SampleBaseEntity, ISampleItem
+            => entity;
+
+        /// <summary>Extension requiring both SampleBaseEntity and IDisposable.</summary>
+        public static T UpgradeDisposableEntity<T>(this T entity) where T : SampleBaseEntity, IDisposable
+            => entity;
+
+        /// <summary>Struct-only extension requiring ISampleItem.</summary>
+        public static string FormatTaggedStruct<T>(this T item) where T : struct, ISampleItem
+            => item.ItemCode;
+
+        /// <summary>Extension targeting a nested type inside a constructed generic host.</summary>
+        public static string DescribeInnerToken(this SampleGenericHost<string>.InnerToken token)
+            => nameof(SampleGenericHost<string>.InnerToken);
+    }
+
+    public class SampleStringList : List<string>
+    {
+    }
+
+    public class SampleGenericHost<T>
+    {
+        public sealed class InnerToken
+        {
+        }
+
+        public sealed class OtherToken
+        {
+        }
+
+        public sealed class NestedPair<U>
+        {
+        }
+    }
+
+    public sealed class SampleNestedDocConsumer
+    {
+        /// <summary>Consumes an inner token.</summary>
+        public void Consume(SampleGenericHost<string>.InnerToken token) { }
+
+        /// <summary>Consumes another token.</summary>
+        public void Consume(SampleGenericHost<string>.OtherToken token) { }
+
+        /// <summary>Consumes a nested generic pair.</summary>
+        public void Consume(SampleGenericHost<string>.NestedPair<int> pair) { }
+    }
+
+    public class SampleTaggedPipe : SampleBaseEntity, ISampleItem
+    {
+        public string ItemCode => "PIPE";
+    }
+
+    public readonly struct SampleTaggedStruct : ISampleItem
+    {
+        public string ItemCode => "STRUCT";
     }
 
     /// <summary>Factory producing pipe segments.</summary>

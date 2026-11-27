@@ -352,13 +352,50 @@ END, m.id ASC";
 
     public IReadOnlyList<MemberRow> GetExtensionMethods(TypeRow target, IReadOnlyList<TypeRow> baseChain, string? memberFilter = null)
     {
-        var targetFulls = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.BareFullName };
-        var targetSimples = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.SimpleName };
+        var queryFulls = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.BareFullName };
+        var querySimples = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.SimpleName };
+        var satisfiedFulls = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.BareFullName };
+        var satisfiedSimples = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.SimpleName };
 
+        void AddBaseTypeReference(string? baseType)
+        {
+            if (string.IsNullOrEmpty(baseType)) return;
+            var bareBase = TypeNameHelper.StripGenerics(baseType);
+            if (bareBase == "System.ValueType")
+            {
+                satisfiedFulls.Add("System.ValueType");
+                satisfiedSimples.Add("ValueType");
+                return;
+            }
+            if (bareBase == "System.Enum")
+            {
+                satisfiedFulls.Add("System.Enum");
+                satisfiedSimples.Add("Enum");
+                satisfiedFulls.Add("System.ValueType");
+                satisfiedSimples.Add("ValueType");
+                return;
+            }
+            if (bareBase is "System.Object" or "System.MulticastDelegate" or "System.Delegate")
+                return;
+
+            var simpleBase = TypeNameHelper.ExtractSimpleTypeName(bareBase);
+            queryFulls.Add(bareBase);
+            satisfiedFulls.Add(bareBase);
+            if (!string.IsNullOrEmpty(simpleBase))
+            {
+                querySimples.Add(simpleBase);
+                satisfiedSimples.Add(simpleBase);
+            }
+        }
+
+        AddBaseTypeReference(target.BaseType);
         foreach (var b in baseChain)
         {
-            targetFulls.Add(b.BareFullName);
-            targetSimples.Add(b.SimpleName);
+            queryFulls.Add(b.BareFullName);
+            querySimples.Add(b.SimpleName);
+            satisfiedFulls.Add(b.BareFullName);
+            satisfiedSimples.Add(b.SimpleName);
+            AddBaseTypeReference(b.BaseType);
         }
 
         // Load exact normalized interfaces from type_interfaces table (handles comma-containing generic interfaces)
@@ -367,57 +404,113 @@ END, m.id ASC";
 
         foreach (var (ifaceFull, ifaceSimple) in LoadInterfacesForTypes(typeIds))
         {
+            satisfiedFulls.Add(ifaceFull);
+            if (!string.IsNullOrEmpty(ifaceSimple))
+                satisfiedSimples.Add(ifaceSimple);
+
             if (NoisyExtensionInterfaces.Contains(ifaceFull) || NoisyExtensionInterfaces.Contains(ifaceSimple))
                 continue;
-            targetFulls.Add(ifaceFull);
+
+            queryFulls.Add(ifaceFull);
             if (!string.IsNullOrEmpty(ifaceSimple))
-                targetSimples.Add(ifaceSimple);
+                querySimples.Add(ifaceSimple);
         }
 
-        if (targetSimples.Count == 0) return Array.Empty<MemberRow>();
+        if (querySimples.Count == 0) return Array.Empty<MemberRow>();
 
-        var simpleParams = targetSimples.Select((_, i) => $"$s{i}").ToList();
-        var sql = $@"
-SELECT m.id, m.type_id, t.full_name, t.simple_name, a.name, a.path, m.kind, m.name, m.accessibility,
-       m.modifiers, m.return_type, m.signature, m.ext_target_type, m.enum_value, m.summary, m.params_doc, m.returns_doc,
-       et.target_full
-FROM extension_targets et
-JOIN members m ON m.id = et.member_id
-JOIN types t ON t.id = m.type_id
-JOIN assemblies a ON a.id = m.assembly_id
-WHERE et.target_simple IN ({string.Join(", ", simpleParams)})";
+        // Step 1: Collect candidate member IDs matching at least one non-noisy target.
+        var candidateIds = new List<long>();
+        var seenCandidateIds = new HashSet<long>();
+        var hasMemberFilter = !string.IsNullOrWhiteSpace(memberFilter);
+        var memberFilterPattern = hasMemberFilter ? "%" + EscapeLike(memberFilter!.Trim()) + "%" : null;
 
-        if (!string.IsNullOrWhiteSpace(memberFilter))
-            sql += @" AND m.name LIKE $mf ESCAPE '\'";
-
-        sql += " ORDER BY t.full_name ASC, m.name ASC LIMIT 300";
-
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = sql;
-        var idx = 0;
-        foreach (var s in targetSimples)
-            cmd.Parameters.AddWithValue($"$s{idx++}", s);
-        if (!string.IsNullOrWhiteSpace(memberFilter))
-            cmd.Parameters.AddWithValue("$mf", "%" + EscapeLike(memberFilter.Trim()) + "%");
-
-        var list = new List<MemberRow>();
-        var seenMemberIds = new HashSet<long>();
-        using var r = cmd.ExecuteReader();
-        while (r.Read() && list.Count < 200)
+        foreach (var chunk in querySimples.Chunk(500))
         {
-            var matchedTargetFull = r.GetString(17);
-            if (matchedTargetFull.Contains('.'))
+            using var cmd = _conn.CreateCommand();
+            var simpleParams = new string[chunk.Length];
+            for (var i = 0; i < chunk.Length; i++)
             {
-                var extBare = TypeNameHelper.StripGenerics(matchedTargetFull);
-                if (!targetFulls.Contains(extBare))
-                    continue;
+                simpleParams[i] = $"$s{i}";
+                cmd.Parameters.AddWithValue(simpleParams[i], chunk[i]);
             }
 
-            var row = ReadMemberRow(r);
-            if (seenMemberIds.Add(row.Id))
-                list.Add(row);
+            var sql = $@"
+SELECT et.member_id, et.target_full, et.target_simple
+FROM extension_targets et";
+            if (hasMemberFilter)
+                sql += @"
+JOIN members m ON m.id = et.member_id";
+
+            sql += $@"
+WHERE et.target_simple IN ({string.Join(", ", simpleParams)})";
+            if (hasMemberFilter)
+            {
+                sql += @"
+  AND m.name LIKE $mf ESCAPE '\'";
+                cmd.Parameters.AddWithValue("$mf", memberFilterPattern!);
+            }
+
+            cmd.CommandText = sql;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var memberId = r.GetInt64(0);
+                var targetFull = r.GetString(1);
+                var targetSimple = r.GetString(2);
+                if (MatchesExtensionTarget(targetFull, targetSimple, queryFulls, querySimples) &&
+                    seenCandidateIds.Add(memberId))
+                {
+                    candidateIds.Add(memberId);
+                }
+            }
         }
-        return list;
+
+        if (candidateIds.Count == 0) return Array.Empty<MemberRow>();
+
+        // Step 2: Verify every required receiver constraint on each candidate member is satisfied.
+        var allTargetConstraints = LoadExtensionTargetsForMembers(candidateIds);
+        var matchedIds = new List<long>(candidateIds.Count);
+        foreach (var memberId in candidateIds)
+        {
+            if (!allTargetConstraints.TryGetValue(memberId, out var reqs) || reqs.Count == 0)
+                continue;
+
+            var allSatisfied = true;
+            foreach (var (reqFull, reqSimple) in reqs)
+            {
+                if (!MatchesExtensionTarget(reqFull, reqSimple, satisfiedFulls, satisfiedSimples))
+                {
+                    allSatisfied = false;
+                    break;
+                }
+            }
+            if (allSatisfied)
+                matchedIds.Add(memberId);
+        }
+
+        if (matchedIds.Count == 0) return Array.Empty<MemberRow>();
+
+        // Step 3: Batch-load verified extension members and return in deterministic order.
+        return BatchLoadMembers(matchedIds).Values
+            .OrderBy(m => m.DeclaringFullName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(m => m.Id)
+            .Take(200)
+            .ToList();
+    }
+
+    private static bool MatchesExtensionTarget(
+        string targetFull,
+        string targetSimple,
+        HashSet<string> targetFulls,
+        HashSet<string> targetSimples)
+    {
+        if (targetFull.Contains('.'))
+        {
+            var extBare = TypeNameHelper.StripGenerics(targetFull);
+            return targetFulls.Contains(extBare);
+        }
+        return targetSimples.Contains(targetSimple);
     }
 
     public HierarchyResult GetHierarchy(TypeRow target, int limit = 100)
@@ -639,6 +732,34 @@ LIMIT $limit";
             {
                 var row = ReadMemberRow(r);
                 map[row.Id] = row;
+            }
+        }
+        return map;
+    }
+
+    private Dictionary<long, List<(string TargetFull, string TargetSimple)>> LoadExtensionTargetsForMembers(List<long> memberIds)
+    {
+        var map = new Dictionary<long, List<(string, string)>>(memberIds.Count);
+        foreach (var chunk in memberIds.Chunk(500))
+        {
+            using var cmd = _conn.CreateCommand();
+            var ph = new string[chunk.Length];
+            for (var i = 0; i < chunk.Length; i++)
+            {
+                ph[i] = $"$mid{i}";
+                cmd.Parameters.AddWithValue(ph[i], chunk[i]);
+            }
+            cmd.CommandText = $"SELECT member_id, target_full, target_simple FROM extension_targets WHERE member_id IN ({string.Join(", ", ph)})";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var mid = r.GetInt64(0);
+                if (!map.TryGetValue(mid, out var list))
+                {
+                    list = new List<(string, string)>(2);
+                    map[mid] = list;
+                }
+                list.Add((r.GetString(1), r.GetString(2)));
             }
         }
         return map;

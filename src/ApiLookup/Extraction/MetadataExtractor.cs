@@ -853,8 +853,18 @@ public static class MetadataExtractor
             extTargets = TypeNameHelper.ResolveExtensionTargets(md, method, docSig.Value.ParameterTypes[0], fullCtx);
         }
 
-        var extTargetFull = extTargets.Count > 0 ? extTargets[0].TargetFull : null;
-        var extTargetSimple = extTargets.Count > 0 ? extTargets[0].TargetSimple : null;
+        var extTargetFull = extTargets.Count switch
+        {
+            0 => null,
+            1 => extTargets[0].TargetFull,
+            _ => string.Join(" & ", extTargets.Select(t => t.TargetFull)),
+        };
+        var extTargetSimple = extTargets.Count switch
+        {
+            0 => null,
+            1 => extTargets[0].TargetSimple,
+            _ => string.Join(" & ", extTargets.Select(t => t.TargetSimple)),
+        };
 
         var docMethodName = isCtor ? "#ctor" : name;
         if (methodGp.Count > 0) docMethodName += $"``{methodGp.Count}";

@@ -147,18 +147,18 @@ internal static class TypeNameHelper
         };
     }
 
-    public static string StripGenerics(string fullName)
+    private static string StripDelimited(string text, char open, char close)
     {
-        if (string.IsNullOrEmpty(fullName) || !fullName.Contains('<'))
-            return fullName;
+        if (string.IsNullOrEmpty(text) || !text.Contains(open))
+            return text;
 
-        var sb = new StringBuilder(fullName.Length);
+        var sb = new StringBuilder(text.Length);
         var depth = 0;
-        foreach (var ch in fullName)
+        foreach (var ch in text)
         {
-            if (ch == '<')
+            if (ch == open)
                 depth++;
-            else if (ch == '>')
+            else if (ch == close)
             {
                 if (depth > 0) depth--;
             }
@@ -166,6 +166,137 @@ internal static class TypeNameHelper
                 sb.Append(ch);
         }
         return sb.ToString();
+    }
+
+    public static string StripGenerics(string fullName) => StripDelimited(fullName, '<', '>');
+
+    public static string StripBraces(string fullName) => StripDelimited(fullName, '{', '}');
+
+    internal static string StripGenericArityFromSegments(string name)
+    {
+        if (string.IsNullOrEmpty(name) || !name.Contains('`'))
+            return name;
+
+        var sb = new StringBuilder(name.Length);
+        var skipUntilSep = false;
+        foreach (var ch in name)
+        {
+            if (ch is '.' or '+')
+            {
+                skipUntilSep = false;
+                sb.Append(ch);
+            }
+            else if (ch == '`')
+            {
+                skipUntilSep = true;
+            }
+            else if (!skipUntilSep)
+            {
+                sb.Append(ch);
+            }
+        }
+        return sb.ToString();
+    }
+
+    public static string ShortenDisplayType(string fullTypeName)
+    {
+        if (string.IsNullOrWhiteSpace(fullTypeName))
+            return fullTypeName;
+
+        var s = fullTypeName.Trim();
+        var suffix = string.Empty;
+        while (s.Length > 0)
+        {
+            var last = s[^1];
+            if (last is '?' or '&' or '*')
+            {
+                suffix = last + suffix;
+                s = s[..^1].TrimEnd();
+            }
+            else if (last == ']')
+            {
+                var open = s.LastIndexOf('[');
+                if (open < 0) break;
+                suffix = s[open..] + suffix;
+                s = s[..open].TrimEnd();
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (s.StartsWith("delegate*<", StringComparison.Ordinal) && s.EndsWith('>'))
+        {
+            var fnArgs = new List<string>();
+            SplitTopLevelArgs(s.AsSpan(10, s.Length - 11), arg => fnArgs.Add(ShortenDisplayType(arg.ToString())));
+            return $"delegate*<{string.Join(", ", fnArgs)}>{suffix}";
+        }
+
+        var segments = new List<string>();
+        var depth = 0;
+        var segStart = 0;
+        for (var i = 0; i < s.Length; i++)
+        {
+            var ch = s[i];
+            if (ch is '<' or '[' or '(') depth++;
+            else if (ch is '>' or ']' or ')') { if (depth > 0) depth--; }
+            else if (ch == '.' && depth == 0)
+            {
+                segments.Add(s[segStart..i]);
+                segStart = i + 1;
+            }
+        }
+        segments.Add(s[segStart..]);
+
+        var firstGenericIdx = -1;
+        for (var i = 0; i < segments.Count; i++)
+        {
+            if (segments[i].Contains('<'))
+            {
+                firstGenericIdx = i;
+                break;
+            }
+        }
+
+        var startIdx = firstGenericIdx >= 0 ? firstGenericIdx : segments.Count - 1;
+        if (firstGenericIdx < 0)
+        {
+            if (segments.Count == 1)
+                return DisplaySignatureProvider.NormalizePrimitiveAlias(segments[0]) + suffix;
+            if (segments.Count == 2 && segments[0] == "System")
+                return DisplaySignatureProvider.NormalizePrimitiveAlias(segments[1]) + suffix;
+        }
+        else if (segments.Count == 2 && segments[0] == "System" &&
+                 segments[1].StartsWith("Nullable<", StringComparison.Ordinal) && segments[1].EndsWith('>'))
+        {
+            var inner = segments[1].AsSpan(9, segments[1].Length - 10);
+            var nullableArgs = new List<string>(1);
+            SplitTopLevelArgs(inner, arg => nullableArgs.Add(ShortenDisplayType(arg.ToString())));
+            if (nullableArgs.Count == 1)
+                return $"{nullableArgs[0]}?{suffix}";
+        }
+
+        var shortenedSegments = new List<string>(segments.Count - startIdx);
+        for (var i = startIdx; i < segments.Count; i++)
+        {
+            var seg = segments[i];
+            var lt = seg.IndexOf('<');
+            var gt = seg.LastIndexOf('>');
+            if (lt >= 0 && gt > lt)
+            {
+                var namePart = seg[..lt];
+                var args = new List<string>();
+                SplitTopLevelArgs(seg.AsSpan(lt + 1, gt - lt - 1), arg => args.Add(ShortenDisplayType(arg.ToString())));
+                shortenedSegments.Add($"{namePart}<{string.Join(", ", args)}>");
+            }
+            else
+            {
+                shortenedSegments.Add(seg);
+            }
+        }
+
+        return string.Join(".", shortenedSegments) + suffix;
     }
 
     public static string StripTypeDecorations(string typeName)
@@ -181,9 +312,8 @@ internal static class TypeNameHelper
         }
 
         s = StripGenerics(s).TrimEnd('?', '&', '*');
-        var brace = s.IndexOf('{');
-        if (brace >= 0) s = s[..brace];
-        return DisplaySignatureProvider.StripGenericArity(s);
+        s = StripBraces(s).TrimEnd('?', '&', '*');
+        return StripGenericArityFromSegments(s);
     }
 
     public static string ExtractSimpleTypeName(string typeName)
@@ -209,7 +339,7 @@ internal static class TypeNameHelper
         if (string.IsNullOrEmpty(trimmed) || trimmed.EndsWith('*'))
             return targets;
 
-        // Check for generic method parameter (`0 / ``0) with type constraints: e.g. `this T entity where T : BaseEntity, IDrawable`
+        // Check for generic method parameter (``0) with type constraints: e.g. `this T entity where T : BaseEntity, IDrawable`
         if (trimmed.StartsWith("``", StringComparison.Ordinal) &&
             int.TryParse(trimmed[2..], out var gpIndex))
         {
@@ -217,16 +347,23 @@ internal static class TypeNameHelper
             if (gpIndex >= 0 && gpIndex < gpHandles.Count)
             {
                 var gp = md.GetGenericParameter(gpHandles.ElementAt(gpIndex));
+                var isValueTypeConstraint = (gp.Attributes & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0;
                 foreach (var ch in gp.GetConstraints())
                 {
                     var constraint = md.GetGenericParameterConstraint(ch);
                     var cFull = StripGenerics(ResolveEntityFullName(md, constraint.Type, fullCtx));
-                    if (string.IsNullOrEmpty(cFull) || cFull is "System.ValueType" or "ValueType" or "System.Object" or "object")
+                    if (string.IsNullOrEmpty(cFull) ||
+                        cFull is "System.ValueType" or "ValueType" or "System.Object" or "object" ||
+                        IsGenericParamName(cFull, fullCtx))
                         continue;
                     var cSimple = ExtractSimpleTypeName(cFull);
                     if (!string.IsNullOrEmpty(cSimple) && seen.Add(cFull))
                         targets.Add(new ExtensionTargetRef(cFull, cSimple));
                 }
+
+                // Preserve `where T : struct` when combined with concrete constraints (e.g. `where T : struct, ISampleItem`).
+                if (isValueTypeConstraint && targets.Count > 0 && seen.Add("System.ValueType"))
+                    targets.Add(new ExtensionTargetRef("System.ValueType", "ValueType"));
             }
             return targets;
         }
@@ -248,9 +385,7 @@ internal static class TypeNameHelper
             }
         }
 
-        var brace = core.IndexOf('{');
-        if (brace >= 0) core = core[..brace];
-        core = DisplaySignatureProvider.StripGenericArity(core);
+        core = StripGenericArityFromSegments(StripBraces(core));
         if (string.IsNullOrEmpty(core))
             return targets;
 

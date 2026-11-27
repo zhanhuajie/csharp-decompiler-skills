@@ -448,8 +448,50 @@ public sealed class XmlDocSignatureProvider : ISignatureTypeProvider<string, Gen
 
     public string GetGenericInstantiation(string genericType, ImmutableArray<string> typeArguments)
     {
-        var bare = DisplaySignatureProvider.StripGenericArity(genericType);
-        return $"{bare}{{{string.Join(",", typeArguments)}}}";
+        if (typeArguments.IsDefaultOrEmpty)
+            return TypeNameHelper.StripGenericArityFromSegments(genericType);
+
+        var segments = genericType.Split('.');
+        var argIndex = 0;
+        for (var i = 0; i < segments.Length; i++)
+        {
+            var seg = segments[i];
+            var tick = seg.IndexOf('`');
+            if (tick < 0) continue;
+
+            var namePart = seg[..tick];
+            if (int.TryParse(seg[(tick + 1)..], out var arity) && arity > 0 && argIndex < typeArguments.Length)
+            {
+                var count = Math.Min(arity, typeArguments.Length - argIndex);
+                var sb = new StringBuilder(namePart).Append('{');
+                for (var j = 0; j < count; j++)
+                {
+                    if (j > 0) sb.Append(',');
+                    sb.Append(typeArguments[argIndex + j]);
+                }
+                sb.Append('}');
+                segments[i] = sb.ToString();
+                argIndex += count;
+            }
+            else
+            {
+                segments[i] = namePart;
+            }
+        }
+
+        var result = string.Join(".", segments);
+        if (argIndex < typeArguments.Length)
+        {
+            var rem = new StringBuilder(result).Append('{');
+            for (var j = argIndex; j < typeArguments.Length; j++)
+            {
+                if (j > argIndex) rem.Append(',');
+                rem.Append(typeArguments[j]);
+            }
+            rem.Append('}');
+            result = rem.ToString();
+        }
+        return result;
     }
 
     public string GetGenericTypeParameter(GenericContext genericContext, int index) => $"`{index}";

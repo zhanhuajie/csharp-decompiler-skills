@@ -63,6 +63,33 @@ public class MetadataExtractorTests
         // Array extension method preserves [] in target so it does NOT collide with single SamplePipeSegment
         var arrayExt = extType.Members.Single(m => m.Name == "CountSegmentArray");
         Assert.Equal("SamplePipeSegment[]", arrayExt.ExtTargetSimple);
+
+        // Multi-constraint extension preserves all constraint targets
+        var multiExt = extType.Members.Single(m => m.Name == "UpgradeTaggedEntity");
+        Assert.Contains(multiExt.ExtensionTargets, et => et.TargetFull == "ApiLookup.Tests.Fixtures.SampleBaseEntity");
+        Assert.Contains(multiExt.ExtensionTargets, et => et.TargetFull == "ApiLookup.Tests.Fixtures.ISampleItem");
+
+        // Extension targeting nested type inside constructed generic host retains nested segment
+        var nestedExt = extType.Members.Single(m => m.Name == "DescribeInnerToken");
+        Assert.Equal("ApiLookup.Tests.Fixtures.SampleGenericHost.InnerToken", nestedExt.ExtTargetType);
+        Assert.Equal("InnerToken", nestedExt.ExtTargetSimple);
+
+        // Same-arity overloads with nested types inside generic declaring types match exact XML docs
+        var consumer = asm.Types.Single(t => t.SimpleName == "SampleNestedDocConsumer");
+        var consumeOverloads = consumer.Members.Where(m => m.Name == "Consume").ToList();
+        Assert.Equal(3, consumeOverloads.Count);
+
+        var innerOverload = consumeOverloads.Single(m => m.Signature.Contains("InnerToken"));
+        Assert.Contains("SampleGenericHost{System.String}.InnerToken", innerOverload.DocId);
+        Assert.Equal("Consumes an inner token.", innerOverload.Summary);
+
+        var otherOverload = consumeOverloads.Single(m => m.Signature.Contains("OtherToken"));
+        Assert.Contains("SampleGenericHost{System.String}.OtherToken", otherOverload.DocId);
+        Assert.Equal("Consumes another token.", otherOverload.Summary);
+
+        var pairOverload = consumeOverloads.Single(m => m.Signature.Contains("NestedPair"));
+        Assert.Contains("SampleGenericHost{System.String}.NestedPair{System.Int32}", pairOverload.DocId);
+        Assert.Equal("Consumes a nested generic pair.", pairOverload.Summary);
     }
 
     [Fact]
@@ -170,6 +197,12 @@ public class MetadataExtractorTests
         Assert.Equal("string", MetadataExtractor.ExtractSimpleTypeName("System.String"));
         Assert.Equal("int", MetadataExtractor.ExtractSimpleTypeName("System.Int32[]"));
         Assert.Equal("Inner", MetadataExtractor.ExtractSimpleTypeName("Ns.Outer<int>.Inner<string>"));
+
+        Assert.Equal("List<string>", TypeNameHelper.ShortenDisplayType("System.Collections.Generic.List<System.String>"));
+        Assert.Equal("SampleContainer<SamplePipeSegment>", TypeNameHelper.ShortenDisplayType("ApiLookup.Tests.Fixtures.SampleContainer<ApiLookup.Tests.Fixtures.SamplePipeSegment>"));
+        Assert.Equal("Outer<int>.Inner<string>[]", TypeNameHelper.ShortenDisplayType("Ns.Outer<System.Int32>.Inner<System.String>[]"));
+        Assert.Equal("Dictionary<int[,], List<string[]>>", TypeNameHelper.ShortenDisplayType("System.Collections.Generic.Dictionary<System.Int32[,], System.Collections.Generic.List<System.String[]>>"));
+        Assert.Equal("delegate*<int, string, void>", TypeNameHelper.ShortenDisplayType("delegate*<int, System.String, void>"));
     }
 
     [Fact]
