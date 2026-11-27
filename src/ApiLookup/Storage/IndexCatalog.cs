@@ -1,11 +1,15 @@
-using Microsoft.Data.Sqlite;
-
 namespace ApiLookup;
 
 public static class IndexCatalog
 {
+    public const string CacheDirEnvVar = "APILOOKUP_CACHE_DIR";
+
     public static string DefaultCacheDirectory()
     {
+        var overrideDir = Environment.GetEnvironmentVariable(CacheDirEnvVar);
+        if (!string.IsNullOrWhiteSpace(overrideDir))
+            return Path.GetFullPath(overrideDir.Trim());
+
         var baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (string.IsNullOrEmpty(baseDir))
             baseDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache");
@@ -67,6 +71,7 @@ public static class IndexCatalog
         var path = GetNamedIndexPath(name, cacheDir);
         if (!File.Exists(path)) return false;
         File.Delete(path);
+        TryDeleteUnlockedFile(path + ".lock");
         return true;
     }
 
@@ -85,6 +90,7 @@ public static class IndexCatalog
             {
                 var len = new FileInfo(file).Length;
                 File.Delete(file);
+                TryDeleteUnlockedFile(file + ".lock");
                 removed.Add(file);
                 freedBytes += len;
             }
@@ -110,7 +116,7 @@ public static class IndexCatalog
             try
             {
                 var stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-                return new BuildLockHandle(stream, lockPath);
+                return new BuildLockHandle(stream);
             }
             catch (IOException) when (DateTime.UtcNow < deadline)
             {
@@ -119,29 +125,51 @@ public static class IndexCatalog
         }
     }
 
-    private static string SanitizeName(string name)
+    internal static string SanitizeName(string name)
     {
-        var chars = name.Trim().ToLowerInvariant()
-            .Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.' ? c : '_')
-            .ToArray();
-        return new string(chars);
+        var trimmed = name.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+            throw new ArgumentException("Index name cannot be empty.");
+
+        var lowered = trimmed.ToLowerInvariant();
+        var replaced = false;
+        var chars = new char[lowered.Length];
+        for (var i = 0; i < lowered.Length; i++)
+        {
+            var c = lowered[i];
+            if (char.IsLetterOrDigit(c) || c is '-' or '_')
+            {
+                chars[i] = c;
+            }
+            else if (c == '.' && lowered is not ("." or ".."))
+            {
+                chars[i] = c;
+            }
+            else
+            {
+                chars[i] = '_';
+                replaced = true;
+            }
+        }
+
+        var safe = new string(chars);
+        // Append short hash if special characters were normalized so "sdk/1" and "sdk:1" never collide
+        return replaced ? $"{safe}-{SourceResolver.ComputeSha256(lowered)[..6]}" : safe;
+    }
+
+    private static void TryDeleteUnlockedFile(string path)
+    {
+        if (!File.Exists(path)) return;
+        try { File.Delete(path); } catch { }
     }
 
     private sealed class BuildLockHandle : IDisposable
     {
         private readonly FileStream _stream;
-        private readonly string _lockPath;
 
-        public BuildLockHandle(FileStream stream, string lockPath)
-        {
-            _stream = stream;
-            _lockPath = lockPath;
-        }
+        public BuildLockHandle(FileStream stream) => _stream = stream;
 
-        public void Dispose()
-        {
-            _stream.Dispose();
-            try { File.Delete(_lockPath); } catch { }
-        }
+        // Intentionally keep the 0-byte .lock file on disk so concurrent POSIX waiters never race on unlink/create
+        public void Dispose() => _stream.Dispose();
     }
 }

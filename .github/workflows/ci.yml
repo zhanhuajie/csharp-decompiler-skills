@@ -28,8 +28,23 @@ jobs:
       - name: Build and test
         run: dotnet test ApiLookup.sln -c Release --no-restore --verbosity normal
 
-      - name: Verify single-file publish (Windows)
+      - name: Verify dotnet tool pack
+        run: dotnet pack src/ApiLookup/ApiLookup.csproj -c Release -o pack-check
+
+      - name: Verify single-file publish & prebuilt binary version (Windows)
         if: matrix.os == 'windows-latest'
+        shell: pwsh
         run: |
           dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r win-x64 --no-self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-check
-          ./publish-check/apilookup.exe --version
+          $builtVer = (./publish-check/apilookup.exe --version).Trim()
+          $repoVer = (./csharp-definition-lookup/scripts/apilookup.exe --version).Trim()
+          Write-Host "Built: $builtVer | Prebuilt: $repoVer"
+          if ($builtVer -ne $repoVer) {
+            throw "Prebuilt apilookup.exe ($repoVer) is out of sync with source ($builtVer). Run .\tools\build.ps1."
+          }
+
+      - name: Verify single-file publish (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r linux-x64 --no-self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-check
+          ./publish-check/apilookup --version

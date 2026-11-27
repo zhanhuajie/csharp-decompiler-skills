@@ -18,7 +18,7 @@ public static partial class Tokenizer
     /// Expands C# identifiers and CJK phrases into FTS5-friendly search tokens:
     /// e.g. "CreateAutoCADOffScreenDevice" ->
     /// "CreateAutoCADOffScreenDevice Create Auto CAD Off Screen Device CreateAuto AutoCAD CADOff OffScreen ScreenDevice"
-    /// and "三维管道段" -> "三维管道段 三维 维管 管道 道段".
+    /// and "三维管道段" -> "三维管道段 三维 维管 管道 道段 段".
     /// </summary>
     public static string BuildSearchTokens(params string?[] inputs)
     {
@@ -45,6 +45,8 @@ public static partial class Tokenizer
                         {
                             for (var i = 0; i + 1 < seg.Length; i++)
                                 Add(seg.Substring(i, 2));
+                            // Emit trailing char so single-char prefix queries ("段"*) match every character position
+                            Add(seg[^1..]);
                         }
                     }
                     else
@@ -67,7 +69,7 @@ public static partial class Tokenizer
     }
 
     /// <summary>
-    /// Extracts CJK segments and their 2-character bigrams from an XML summary when CJK characters are present.
+    /// Extracts CJK segments, their 2-character bigrams, and trailing char from an XML summary when CJK characters are present.
     /// Returns empty string for pure non-CJK summaries so English-only indexes incur zero bloat.
     /// </summary>
     public static string BuildCjkSummaryTokens(string? summary)
@@ -104,6 +106,7 @@ public static partial class Tokenizer
                 {
                     for (var i = 0; i + 1 < seg.Length; i++)
                         Add(seg.Substring(i, 2));
+                    Add(seg[^1..]);
                 }
             }
         }
@@ -195,11 +198,11 @@ public static partial class Tokenizer
                 else
                 {
                     var parts = SplitCamelCase(seg);
-                    if (parts.Count > 1)
+                    // Avoid expanding 1-char prefixes (e.g. "IList" -> "I"* AND "List"*) which scan every 'i*' word in FTS5
+                    if (parts.Count > 1 && parts.All(p => p.Length >= 2))
                     {
                         if (seen.Add(seg))
                         {
-                            // Match either the whole chunk prefix OR all its CamelCase parts
                             var subTerms = parts.Select(p => $"\"{EscapeFts(p)}\"*");
                             clauses.Add($"(\"{EscapeFts(seg)}\"* OR ({string.Join(" AND ", subTerms)}))");
                         }

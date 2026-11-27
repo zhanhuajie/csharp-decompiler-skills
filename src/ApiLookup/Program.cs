@@ -24,6 +24,7 @@ public static class Program
     {
         var outWriter = stdout ?? Console.Out;
         var errWriter = stderr ?? Console.Error;
+        var wantsJson = args.Any(a => string.Equals(a, "--json", StringComparison.OrdinalIgnoreCase));
 
         CliOptions opts;
         try
@@ -32,7 +33,7 @@ public static class Program
         }
         catch (ArgumentException ex)
         {
-            errWriter.WriteLine($"Error: {ex.Message}");
+            OutputFormatter.WriteError(ex.Message, 1, wantsJson, outWriter, errWriter);
             return 1;
         }
 
@@ -41,7 +42,7 @@ public static class Program
             var ver = typeof(Program).Assembly
                 .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
                 ?? typeof(Program).Assembly.GetName().Version?.ToString()
-                ?? "0.2.0";
+                ?? "0.3.0";
             var plusIdx = ver.IndexOf('+');
             if (plusIdx >= 0) ver = ver[..plusIdx];
             outWriter.WriteLine($"apilookup {ver}");
@@ -60,54 +61,50 @@ public static class Program
         }
         catch (Exception ex)
         {
-            errWriter.WriteLine($"Error: {ex.Message}");
+            OutputFormatter.WriteError(ex.Message, 1, opts.Json, outWriter, errWriter);
             return 1;
         }
     }
 
     private static int Execute(CliOptions opts, TextWriter outWriter, TextWriter errWriter)
     {
-        switch (opts.Command)
+        return opts.Command switch
         {
-            case "index":
-                return RunIndex(opts, outWriter, errWriter);
-            case "search":
-                return RunSearch(opts, outWriter, errWriter);
-            case "show":
-                return RunShow(opts, outWriter, errWriter);
-            case "hierarchy":
-                return RunHierarchy(opts, outWriter, errWriter);
-            case "by-type":
-                return RunByType(opts, outWriter, errWriter);
-            case "refs":
-                return RunRefs(opts, outWriter, errWriter);
-            case "locate":
-            case "scan":
-                return RunLocate(opts, outWriter, errWriter);
-            default:
-                errWriter.WriteLine($"Unknown command: {opts.Command}. Run 'apilookup --help' for usage.");
-                return 1;
-        }
+            "index" => RunIndex(opts, outWriter, errWriter),
+            "search" => RunSearch(opts, outWriter, errWriter),
+            "show" => RunShow(opts, outWriter, errWriter),
+            "hierarchy" => RunHierarchy(opts, outWriter, errWriter),
+            "by-type" => RunByType(opts, outWriter, errWriter),
+            "refs" => RunRefs(opts, outWriter, errWriter),
+            "locate" or "scan" => RunLocate(opts, outWriter, errWriter),
+            _ => FailWithMessage($"Unknown command: {opts.Command}. Run 'apilookup --help' for usage.", opts.Json, outWriter, errWriter),
+        };
+    }
+
+    private static int FailWithMessage(string message, bool json, TextWriter outWriter, TextWriter errWriter)
+    {
+        OutputFormatter.WriteError(message, 1, json, outWriter, errWriter);
+        return 1;
     }
 
     private static int RunIndex(CliOptions opts, TextWriter outWriter, TextWriter errWriter)
     {
         if (opts.ListIndexes)
         {
-            OutputFormatter.WriteIndexList(IndexStore.ListIndexes(), opts.Json, outWriter);
+            OutputFormatter.WriteIndexList(IndexCatalog.ListIndexes(), opts.Json, outWriter);
             return 0;
         }
 
         if (!string.IsNullOrWhiteSpace(opts.DropIndex))
         {
-            var dropped = IndexStore.DropNamedIndex(opts.DropIndex);
+            var dropped = IndexCatalog.DropNamedIndex(opts.DropIndex);
             OutputFormatter.WriteDropIndex(new DropIndexResult(opts.DropIndex, dropped), opts.Json, outWriter);
             return dropped ? 0 : 1;
         }
 
         if (opts.PruneAuto)
         {
-            var pruned = IndexStore.PruneAutoIndexes();
+            var pruned = IndexCatalog.PruneAutoIndexes();
             OutputFormatter.WritePruneResult(pruned, opts.Json, outWriter);
             return 0;
         }
@@ -147,26 +144,10 @@ public static class Program
         var typeQuery = opts.Positional[0];
         using var store = OpenIndexForQuery(opts, errWriter);
 
-        var matches = store.ResolveType(typeQuery, opts.NamespaceFilter, opts.AssemblyFilter);
-        if (matches.Count == 0)
-        {
-            errWriter.WriteLine($"Type '{typeQuery}' not found. Try 'apilookup search \"{typeQuery}\"' to find matching symbols.");
-            return 1;
-        }
+        var exitCode = TryResolveSingleType(store, typeQuery, opts, outWriter, errWriter, out var target);
+        if (exitCode != 0 || target == null)
+            return exitCode;
 
-        if (matches.Count > 1)
-        {
-            var exactFull = matches.Where(m => m.FullName.Equals(typeQuery, StringComparison.OrdinalIgnoreCase)).ToList();
-            if (exactFull.Count == 1)
-                matches = exactFull;
-            else
-            {
-                OutputFormatter.WriteAmbiguousTypes(typeQuery, matches, opts.Json, outWriter);
-                return 2;
-            }
-        }
-
-        var target = matches[0];
         var ownMembers = store.GetMembers(target.Id, opts.MemberFilter);
 
         var baseChain = (opts.IncludeInherited || opts.IncludeExtensions)
@@ -205,26 +186,53 @@ public static class Program
         var typeQuery = opts.Positional[0];
         using var store = OpenIndexForQuery(opts, errWriter);
 
+        var exitCode = TryResolveSingleType(store, typeQuery, opts, outWriter, errWriter, out var target);
+        if (exitCode != 0 || target == null)
+            return exitCode;
+
+        var limit = opts.Limit ?? 100;
+        var result = store.GetHierarchy(target, limit);
+        OutputFormatter.WriteHierarchy(result, opts.Json, outWriter);
+        return 0;
+    }
+
+    private static int TryResolveSingleType(
+        IndexStore store,
+        string typeQuery,
+        CliOptions opts,
+        TextWriter outWriter,
+        TextWriter errWriter,
+        out TypeRow? resolved)
+    {
+        resolved = null;
         var matches = store.ResolveType(typeQuery, opts.NamespaceFilter, opts.AssemblyFilter);
         if (matches.Count == 0)
         {
-            errWriter.WriteLine($"Type '{typeQuery}' not found.");
+            var msg = $"Type '{typeQuery}' not found. Try 'apilookup search \"{typeQuery}\"' to find matching symbols.";
+            if (opts.Json)
+                OutputFormatter.WriteError(msg, 1, json: true, outWriter, errWriter);
+            else
+                errWriter.WriteLine(msg);
             return 1;
         }
+
         if (matches.Count > 1)
         {
-            var exactFull = matches.Where(m => m.FullName.Equals(typeQuery, StringComparison.OrdinalIgnoreCase)).ToList();
-            if (exactFull.Count == 1) matches = exactFull;
-            else
+            var exactFull = matches.Where(m =>
+                m.FullName.Equals(typeQuery, StringComparison.OrdinalIgnoreCase) ||
+                m.ClrName.Equals(typeQuery, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            if (exactFull.Count == 1)
             {
-                OutputFormatter.WriteAmbiguousTypes(typeQuery, matches, opts.Json, outWriter);
-                return 2;
+                resolved = exactFull[0];
+                return 0;
             }
+
+            OutputFormatter.WriteAmbiguousTypes(typeQuery, matches, opts.Json, outWriter);
+            return 2;
         }
 
-        var limit = opts.Limit ?? 100;
-        var result = store.GetHierarchy(matches[0], limit);
-        OutputFormatter.WriteHierarchy(result, opts.Json, outWriter);
+        resolved = matches[0];
         return 0;
     }
 
@@ -309,7 +317,7 @@ public static class Program
 
         if (!string.IsNullOrWhiteSpace(opts.IndexName) || !string.IsNullOrWhiteSpace(opts.DbPath))
         {
-            var dbPath = IndexStore.ResolveDbPath(opts.IndexName, opts.DbPath, sourceKey: null);
+            var dbPath = IndexCatalog.ResolveDbPath(opts.IndexName, opts.DbPath, sourceKey: null);
             using var store = IndexStore.OpenReadOnly(dbPath);
             var assemblies = store.ListAssemblies();
             var matches = store.ResolveType(typeQuery, opts.NamespaceFilter, opts.AssemblyFilter)
@@ -341,7 +349,7 @@ public static class Program
 
         if (!string.IsNullOrWhiteSpace(opts.IndexName) || !string.IsNullOrWhiteSpace(opts.DbPath))
         {
-            var dbPath = IndexStore.ResolveDbPath(opts.IndexName, opts.DbPath, sourceKey: null);
+            var dbPath = IndexCatalog.ResolveDbPath(opts.IndexName, opts.DbPath, sourceKey: null);
             return IndexStore.OpenReadOnly(dbPath);
         }
 
@@ -369,14 +377,14 @@ public static class Program
         if (resolved.Assemblies.Count == 0)
             throw new InvalidOperationException("No managed .NET assemblies found in the specified sources.");
 
-        var dbPath = IndexStore.ResolveDbPath(opts.IndexName, opts.DbPath, resolved.SourceKey);
+        var dbPath = IndexCatalog.ResolveDbPath(opts.IndexName, opts.DbPath, resolved.SourceKey);
         var descParts = new List<string>();
         descParts.AddRange(opts.Dirs.Select(d => "dir:" + Path.GetFullPath(d)));
         descParts.AddRange(opts.Projects.Select(p => "project:" + Path.GetFullPath(p)));
         descParts.AddRange(opts.Dlls.Select(d => "dll:" + Path.GetFullPath(d)));
 
         var extractWarnings = new List<string>();
-        var result = IndexStore.EnsureBuilt(
+        var result = IndexBuilder.EnsureBuilt(
             dbPath,
             opts.IndexName,
             resolved,
@@ -572,7 +580,7 @@ Commands:
   index                        Build/refresh an index (--list / --drop <name> / --prune)
   search <query>               Full-text & CamelCase/CJK search across types, members, and XML docs
   show <TypeName>              Print clean C# API skeleton (members, XML docs, inherited, extensions)
-  hierarchy <TypeName>         Show base class chain, interfaces, and derived/implementing types
+  hierarchy <TypeName>         Show base class/interface chain, interfaces, and derived/implementing types
   by-type <TypeName>           Find methods/properties/ctors returning or accepting <TypeName>
   locate <TypeName>            Fast zero-cache PE scan to locate a type's DLL & namespace (alias: scan)
   refs                         List indexed assemblies and XML doc availability
@@ -580,12 +588,12 @@ Commands:
 Source & Index Options (usable on any command; auto-cached by file fingerprint):
   -i, --index <name>           Use or build a named index (alias: --name)
   --db <path>                  Explicit SQLite database file path
-  -d, --dir <path>             Scan directory for managed .NET DLLs (repeatable, recursive)
+  -d, --dir <path>             Scan directory for managed .NET DLLs/EXEs (repeatable, recursive)
   -p, --project <csproj>       Resolve NuGet (project.assets.json) + HintPath DLLs (repeatable)
   --dll <path>                 Index specific assembly file(s) (repeatable)
   --tfm <tfm>                  Target framework to pick from multi-TFM project.assets.json (e.g. net8.0)
-  --include <glob>             Only index DLL filenames matching glob (repeatable, e.g. ""PnP*.dll"")
-  --exclude <glob>             Skip DLL filenames matching glob (repeatable, e.g. ""DevExpress.*"")
+  --include <glob>             Only index filenames matching glob (repeatable, e.g. ""PnP*.dll"")
+  --exclude <glob>             Skip filenames matching glob (repeatable, e.g. ""DevExpress.*"")
   --no-recursive               Do not recurse subdirectories for --dir
   --include-nonpublic          Also index internal/private types and members
   --force                      Force rebuild even if cached fingerprint matches
@@ -596,15 +604,18 @@ Query Options:
   --ns, --namespace <prefix>   Filter by namespace prefix (e.g. Autodesk.ProcessPower)
   --asm, --assembly <part>     Filter by assembly name substring (e.g. PnP3d)
   -m, --member <substring>     Filter members in 'show' (e.g. --member Port)
-  --inherited                  Include inherited members from base types in 'show'
+  --inherited                  Include inherited members from base classes/interfaces in 'show'
   --ext                        Include extension methods targeting this type in 'show'
   --docs                       Include full @param / @returns / Remarks XML docs in 'show'
   --role <return|param|both>   Filter direction in 'by-type' (default: both)
   -l, --limit <n>              Max results (default: 30 for search, 40 for by-type, 100 for hierarchy)
   --list-refs                  Print indexed assemblies before search results
-  --json                       Emit structured JSON
+  --json                       Emit structured camelCase JSON (including error objects)
   --verbose                    Print detailed metadata/XML warnings to stderr
   -v, --version                Print version and exit
+
+Environment:
+  APILOOKUP_CACHE_DIR          Override default SQLite index cache directory
 
 Exit Codes:
   0  Success (or help/version printed)

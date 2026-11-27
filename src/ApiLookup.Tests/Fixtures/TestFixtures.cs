@@ -67,25 +67,76 @@ namespace ApiLookup.Tests.Fixtures
         Elbow = 2,
     }
 
+    [Flags]
+    public enum SampleAccessFlags
+    {
+        None = 0,
+        Read = 1,
+        Write = 2,
+        Execute = 4,
+    }
+
+    public readonly struct SampleReadOnlyPoint
+    {
+        private static readonly double OriginX = 0.0;
+        public SampleReadOnlyPoint(in double x) { }
+        public ref readonly double X => ref OriginX;
+    }
+
+    public ref struct SampleRefSpanReader
+    {
+        private readonly int[] _buf;
+        public SampleRefSpanReader(int[] buf) => _buf = buf;
+        public ref int Position => ref _buf[0];
+    }
+
+    public readonly ref struct SampleReadOnlyRefView
+    {
+    }
+
+    public static class OuterBox
+    {
+        public static class MiddleBox
+        {
+            public sealed class DeepLeaf
+            {
+            }
+        }
+    }
+
     /// <summary>Extension helpers for <see cref="SampleBaseEntity"/>.</summary>
     public static class SampleEntityExtensions
     {
         /// <summary>Creates an off-screen preview device snapshot for an entity.</summary>
         public static string CreateAutoCADOffScreenDeviceSnapshot(this SampleBaseEntity entity, int width = 800)
             => $"{entity.Handle}:{width}";
+
+        /// <summary>Generic constrained extension helper targeting any SampleBaseEntity.</summary>
+        public static T UpgradeEntityOpen<T>(this T entity) where T : SampleBaseEntity
+            => entity;
+
+        /// <summary>Array-only extension that must NOT appear on a single SamplePipeSegment.</summary>
+        public static int CountSegmentArray(this SamplePipeSegment[] segments)
+            => segments.Length;
     }
 
     /// <summary>Factory producing pipe segments.</summary>
     public static class SamplePipeFactory
     {
+        public const decimal DefaultWallThickness = 12.75m;
+
         /// <summary>Builds a default straight pipe segment.</summary>
-        public static SamplePipeSegment CreateDefaultPipe(double od) => new(od);
+        public static SamplePipeSegment CreateDefaultPipe(double od, decimal tolerance = 0.05m) => new(od);
 
         public static IList<SamplePipeSegment> CreatePipeBatch(int count) => new List<SamplePipeSegment>();
 
         public static Task<SamplePipeSegment> CreatePipeAsync() => Task.FromResult(new SamplePipeSegment(10.0));
 
         public static SamplePipeSegment[,,] CreatePipeGrid() => new SamplePipeSegment[1, 1, 1];
+
+        public static SampleAccessFlags OpenWithFlags(
+            SampleAccessFlags flags = SampleAccessFlags.Read | SampleAccessFlags.Write,
+            SamplePipeKind fallbackKind = (SamplePipeKind)99) => flags;
 
         public static int op_Custom_Add(int x, int y) => x + y;
     }
@@ -131,15 +182,21 @@ namespace ApiLookup.Tests.Fixtures
         string ItemCode { get; }
     }
 
+    public interface IDerivedSampleItem : ISampleItem
+    {
+        string SubCategory { get; }
+    }
+
     public interface ISampleItemSource
     {
         IEnumerable<ISampleItem> GetItems();
     }
 
-    public class SampleItemImpl : ISampleItem, IDictionary<string, SamplePipeSegment>
+    public class SampleItemImpl : IDerivedSampleItem, IDictionary<string, SamplePipeSegment>
     {
         private readonly Dictionary<string, SamplePipeSegment> _inner = new();
         public string ItemCode => "ITEM";
+        public string SubCategory => "SUB";
         public SamplePipeSegment this[string key] { get => _inner[key]; set => _inner[key] = value; }
         public ICollection<string> Keys => _inner.Keys;
         public ICollection<SamplePipeSegment> Values => _inner.Values;

@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
@@ -51,7 +50,7 @@ public static class MetadataExtractor
             var asmName = md.GetString(asmDef.Name);
             var asmVersion = asmDef.Version.ToString();
             var xmlDocs = XmlDocReader.Load(xmlPath, warnings);
-            var enumLookup = BuildEnumLookup(md);
+            var (enumLookup, refLookup) = ConstantAndAttributeReader.ScanAssemblyTypes(md, includeNonPublic);
 
             var types = new List<ExtractedType>();
             foreach (var handle in md.TypeDefinitions)
@@ -61,9 +60,16 @@ public static class MetadataExtractor
                 if (ShouldSkipType(md, td, rawName, includeNonPublic))
                     continue;
 
-                var extracted = ExtractType(md, td, xmlDocs, enumLookup, includeNonPublic);
+                var extracted = ExtractType(md, td, xmlDocs, enumLookup, refLookup, includeNonPublic);
                 if (extracted != null)
                     types.Add(extracted);
+            }
+
+            if (types.Count == 0 && md.ExportedTypes.Count > 0)
+            {
+                var forwarders = md.ExportedTypes.Count(h => md.GetExportedType(h).IsForwarder);
+                if (forwarders > 0)
+                    warnings?.Add($"Assembly '{asmName}' ({fullPath}) is a type-forwarding facade ({forwarders} forwarded types, 0 local definitions). Use 'locate' or index its target implementation assembly.");
             }
 
             return new ExtractedAssembly(
@@ -80,61 +86,6 @@ public static class MetadataExtractor
             warnings?.Add($"Failed to extract metadata from '{fullPath}': {ex.Message}");
             return null;
         }
-    }
-
-    private sealed class EnumLookup
-    {
-        private readonly Dictionary<string, Dictionary<string, string>> _byFull = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, Dictionary<string, string>?> _bySimple = new(StringComparer.Ordinal);
-
-        public void Register(string fullName, string simpleName, Dictionary<string, string> values)
-        {
-            if (values.Count == 0) return;
-            _byFull[fullName] = values;
-            if (!_bySimple.TryAdd(simpleName, values))
-                _bySimple[simpleName] = null; // Ambiguous simple name
-        }
-
-        public string? ResolveMemberName(string typeDisplayName, string numericValue)
-        {
-            var bare = StripGenerics(typeDisplayName).TrimEnd('?', '&', '*');
-            if (_byFull.TryGetValue(bare, out var fullMap) && fullMap.TryGetValue(numericValue, out var name))
-                return name;
-
-            var simple = ExtractSimpleTypeName(bare);
-            if (_bySimple.TryGetValue(simple, out var simpleMap) && simpleMap != null && simpleMap.TryGetValue(numericValue, out name))
-                return name;
-
-            return null;
-        }
-    }
-
-    private static EnumLookup BuildEnumLookup(MetadataReader md)
-    {
-        var lookup = new EnumLookup();
-        foreach (var handle in md.TypeDefinitions)
-        {
-            var td = md.GetTypeDefinition(handle);
-            if (td.BaseType.Kind != HandleKind.TypeReference) continue;
-            var baseTr = md.GetTypeReference((TypeReferenceHandle)td.BaseType);
-            if (md.GetString(baseTr.Name) != "Enum" || md.GetString(baseTr.Namespace) != "System")
-                continue;
-
-            var (_, _, displayFull, bareFull, _, simpleName) = BuildTypeNames(md, td);
-            var map = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var fh in td.GetFields())
-            {
-                var f = md.GetFieldDefinition(fh);
-                if ((f.Attributes & FieldAttributes.Literal) == 0) continue;
-                var ch = f.GetDefaultValue();
-                if (ch.IsNil) continue;
-                var val = ReadConstantValue(md, md.GetConstant(ch));
-                if (val != null)
-                    map.TryAdd(val, md.GetString(f.Name));
-            }
-            lookup.Register(bareFull, simpleName, map);
-        }
-        return lookup;
     }
 
     internal static bool ShouldSkipType(MetadataReader md, TypeDefinition td, string rawName, bool includeNonPublic)
@@ -170,37 +121,49 @@ public static class MetadataExtractor
         };
     }
 
+    internal static (string ns, string clrName, string displayFull, string bareFull, string displayName, string simpleName)
+        BuildTypeNames(MetadataReader md, TypeDefinition td)
+        => TypeNameHelper.BuildTypeNames(md, td);
+
+    public static string StripGenerics(string fullName) => TypeNameHelper.StripGenerics(fullName);
+    public static string ExtractSimpleTypeName(string typeName) => TypeNameHelper.ExtractSimpleTypeName(typeName);
+    public static List<string> ExtractReferencedSimpleTypeNames(string displayType, GenericContext? ctx = null)
+        => TypeNameHelper.ExtractReferencedSimpleTypeNames(displayType, ctx);
+
     private static ExtractedType? ExtractType(
         MetadataReader md,
         TypeDefinition td,
         XmlDocBook xmlDocs,
         EnumLookup enumLookup,
+        ReferenceTypeLookup refLookup,
         bool includeNonPublic)
     {
-        var (ns, clrName, displayFullName, bareFullName, displayName, simpleName) = BuildTypeNames(md, td);
+        var (ns, clrName, displayFullName, bareFullName, displayName, simpleName) = TypeNameHelper.BuildTypeNames(md, td);
 
-        var genericParamNames = ReadGenericParamNames(md, td.GetGenericParameters());
-        var genericCtx = new GenericContext(genericParamNames, Array.Empty<string>());
+        var genericParamNames = TypeNameHelper.ReadGenericParamNames(md, td.GetGenericParameters());
+        var valueGenericParams = TypeNameHelper.ReadValueTypeGenericParams(md, td.GetGenericParameters());
+        var genericCtx = new GenericContext(genericParamNames, Array.Empty<string>(), valueGenericParams);
 
         var (baseFull, baseBare, baseSimple) = ResolveBaseType(md, td, genericCtx);
         var kind = DetermineTypeKind(td, baseFull);
         var visibility = GetEffectiveVisibility(md, td);
-        var modifiers = DetermineTypeModifiers(td, kind);
+        var modifiers = DetermineTypeModifiers(md, td, kind);
         var (interfaces, interfaceRefs) = ResolveInterfaces(md, td, genericCtx);
         var genericConstraints = ReadGenericConstraints(md, td.GetGenericParameters(), genericCtx);
-        var isExtContainer = HasAttribute(md, td.GetCustomAttributes(), "System.Runtime.CompilerServices", "ExtensionAttribute");
-        var defaultMemberName = ReadDefaultMemberName(md, td) ?? "Item";
+        var isExtContainer = ConstantAndAttributeReader.HasAttribute(md, td.GetCustomAttributes(), "System.Runtime.CompilerServices", "ExtensionAttribute");
+        var defaultMemberName = ConstantAndAttributeReader.ReadDefaultMemberName(md, td) ?? "Item";
+        var typeNullCtx = ResolveInheritedNullableContext(md, td);
 
         var docId = "T:" + clrName.Replace('+', '.');
         var typeDoc = xmlDocs.Find(docId);
 
         var delegateSignature = kind == "delegate"
-            ? ExtractDelegateSignature(md, td, visibility, displayName, genericConstraints, genericCtx)
+            ? ExtractDelegateSignature(md, td, visibility, displayName, genericConstraints, genericCtx, typeNullCtx, enumLookup, refLookup)
             : null;
 
         var members = ExtractMembers(
-            md, td, clrName, simpleName, kind, genericCtx, isExtContainer,
-            defaultMemberName, xmlDocs, enumLookup, includeNonPublic);
+            md, td, bareFullName, clrName, simpleName, kind, genericCtx, isExtContainer,
+            defaultMemberName, typeNullCtx, xmlDocs, enumLookup, refLookup, includeNonPublic);
 
         return new ExtractedType(
             FullName: displayFullName,
@@ -227,61 +190,16 @@ public static class MetadataExtractor
             Members: members);
     }
 
-    internal static (string ns, string clrName, string displayFull, string bareFull, string displayName, string simpleName)
-        BuildTypeNames(MetadataReader md, TypeDefinition td)
+    private static byte ResolveInheritedNullableContext(MetadataReader md, TypeDefinition td)
     {
-        var chain = new List<TypeDefinition>();
-        var current = td;
+        var cur = td;
         while (true)
         {
-            chain.Add(current);
-            if (!current.IsNested) break;
-            current = md.GetTypeDefinition(current.GetDeclaringType());
+            var ctx = ConstantAndAttributeReader.ReadNullableContext(md, cur.GetCustomAttributes());
+            if (ctx.HasValue) return ctx.Value;
+            if (!cur.IsNested) return 0;
+            cur = md.GetTypeDefinition(cur.GetDeclaringType());
         }
-        chain.Reverse();
-
-        var ns = md.GetString(chain[0].Namespace);
-        var clrParts = new List<string>(chain.Count);
-        var dispParts = new List<string>(chain.Count);
-        var bareParts = new List<string>(chain.Count);
-        var totalOuterParams = 0;
-
-        for (var i = 0; i < chain.Count; i++)
-        {
-            var cur = chain[i];
-            var raw = md.GetString(cur.Name);
-            clrParts.Add(raw);
-
-            var bare = DisplaySignatureProvider.StripGenericArity(raw);
-            bareParts.Add(bare);
-
-            var allGp = ReadGenericParamNames(md, cur.GetGenericParameters());
-            var ownGp = allGp.Count > totalOuterParams
-                ? allGp.Skip(totalOuterParams).ToList()
-                : new List<string>();
-            totalOuterParams = allGp.Count;
-
-            dispParts.Add(ownGp.Count > 0 ? $"{bare}<{string.Join(", ", ownGp)}>" : bare);
-        }
-
-        var clrJoined = string.Join("+", clrParts);
-        var dispJoined = string.Join(".", dispParts);
-        var bareJoined = string.Join(".", bareParts);
-        var clrName = string.IsNullOrEmpty(ns) ? clrJoined : $"{ns}.{clrJoined}";
-        var displayFull = string.IsNullOrEmpty(ns) ? dispJoined : $"{ns}.{dispJoined}";
-        var bareFull = string.IsNullOrEmpty(ns) ? bareJoined : $"{ns}.{bareJoined}";
-        var displayName = dispParts[^1];
-        var simpleName = bareParts[^1];
-
-        return (ns, clrName, displayFull, bareFull, displayName, simpleName);
-    }
-
-    private static List<string> ReadGenericParamNames(MetadataReader md, GenericParameterHandleCollection handles)
-    {
-        var list = new List<string>(handles.Count);
-        foreach (var h in handles)
-            list.Add(md.GetString(md.GetGenericParameter(h).Name));
-        return list;
     }
 
     private static string ReadGenericConstraints(MetadataReader md, GenericParameterHandleCollection handles, GenericContext ctx)
@@ -305,7 +223,7 @@ public static class MetadataExtractor
             foreach (var ch in gp.GetConstraints())
             {
                 var constraint = md.GetGenericParameterConstraint(ch);
-                var typeName = ResolveEntityDisplayName(md, constraint.Type, ctx);
+                var typeName = TypeNameHelper.ResolveEntityDisplayName(md, constraint.Type, ctx);
                 if (string.IsNullOrEmpty(typeName)) continue;
                 if (isStruct && typeName is "ValueType" or "System.ValueType") continue;
                 clauses.Add(typeName);
@@ -327,7 +245,10 @@ public static class MetadataExtractor
         string visibility,
         string displayName,
         string genericConstraints,
-        GenericContext genericCtx)
+        GenericContext genericCtx,
+        byte typeNullCtx,
+        EnumLookup enumLookup,
+        ReferenceTypeLookup refLookup)
     {
         foreach (var mh in td.GetMethods())
         {
@@ -338,20 +259,28 @@ public static class MetadataExtractor
             try { sig = method.DecodeSignature(DisplaySignatureProvider.Instance, genericCtx); }
             catch { return null; }
 
-            var paramInfos = ReadParamMetadata(md, method);
+            var methodNullCtx = ConstantAndAttributeReader.ReadNullableContext(md, method.GetCustomAttributes()) ?? typeNullCtx;
+            var (retInfo, paramInfos) = ReadParamMetadata(md, method);
+
+            var retRaw = ConstantAndAttributeReader.ApplyTopLevelNullability(sig.ReturnType, retInfo?.NullFlag, methodNullCtx, refLookup, genericCtx);
+            var retText = FormatReturnRefPrefix(retRaw, retInfo);
+
             var sb = new StringBuilder();
-            sb.Append(visibility).Append(" delegate ").Append(sig.ReturnType).Append(' ').Append(displayName).Append('(');
+            sb.Append(visibility).Append(" delegate ").Append(retText).Append(' ').Append(displayName).Append('(');
             for (var i = 0; i < sig.ParameterTypes.Length; i++)
             {
                 if (i > 0) sb.Append(", ");
-                var rawPt = sig.ParameterTypes[i];
                 paramInfos.TryGetValue(i + 1, out var pi);
+                var rawPt = ConstantAndAttributeReader.ApplyTopLevelNullability(sig.ParameterTypes[i], pi?.NullFlag, methodNullCtx, refLookup, genericCtx);
 
                 if (pi?.IsParams == true) sb.Append("params ");
                 var cleanPt = FormatByRefPrefix(rawPt, pi, sb);
                 sb.Append(cleanPt).Append(' ').Append(string.IsNullOrEmpty(pi?.Name) ? $"arg{i}" : pi.Name);
                 if (pi?.DefaultValue != null)
-                    sb.Append(" = ").Append(pi.DefaultValue);
+                {
+                    var defText = ConstantAndAttributeReader.FormatDefaultValue(cleanPt, pi.DefaultValue, pi.IsIntegerConst, enumLookup, genericCtx);
+                    sb.Append(" = ").Append(defText);
+                }
             }
             sb.Append(')');
             if (!string.IsNullOrEmpty(genericConstraints))
@@ -364,10 +293,10 @@ public static class MetadataExtractor
     private static (string? full, string? bare, string? simple) ResolveBaseType(MetadataReader md, TypeDefinition td, GenericContext ctx)
     {
         if (td.BaseType.IsNil) return (null, null, null);
-        var full = ResolveEntityFullName(md, td.BaseType, ctx);
+        var full = TypeNameHelper.ResolveEntityFullName(md, td.BaseType, ctx);
         if (string.IsNullOrEmpty(full)) return (null, null, null);
-        var bare = StripGenerics(full);
-        var simple = ExtractSimpleTypeName(bare);
+        var bare = TypeNameHelper.StripGenerics(full);
+        var simple = TypeNameHelper.ExtractSimpleTypeName(bare);
         return (full, bare, simple);
     }
 
@@ -383,42 +312,20 @@ public static class MetadataExtractor
         foreach (var ih in td.GetInterfaceImplementations())
         {
             var impl = md.GetInterfaceImplementation(ih);
-            var disp = ResolveEntityDisplayName(md, impl.Interface, ctx);
+            var disp = TypeNameHelper.ResolveEntityDisplayName(md, impl.Interface, ctx);
             if (!string.IsNullOrEmpty(disp))
                 displayNames.Add(disp);
 
-            var full = ResolveEntityFullName(md, impl.Interface, ctx);
+            var full = TypeNameHelper.ResolveEntityFullName(md, impl.Interface, ctx);
             if (!string.IsNullOrEmpty(full))
             {
-                var bare = StripGenerics(full);
-                var simple = ExtractSimpleTypeName(bare);
+                var bare = TypeNameHelper.StripGenerics(full);
+                var simple = TypeNameHelper.ExtractSimpleTypeName(bare);
                 if (!string.IsNullOrEmpty(bare) && seenRefs.Add(bare))
                     refs.Add(new InterfaceRef(bare, simple));
             }
         }
         return (displayNames, refs);
-    }
-
-    private static string ResolveEntityFullName(MetadataReader md, EntityHandle handle, GenericContext ctx)
-    {
-        return handle.Kind switch
-        {
-            HandleKind.TypeDefinition => FullNameDisplaySignatureProvider.Instance.GetTypeFromDefinition(md, (TypeDefinitionHandle)handle, 0),
-            HandleKind.TypeReference => FullNameDisplaySignatureProvider.Instance.GetTypeFromReference(md, (TypeReferenceHandle)handle, 0),
-            HandleKind.TypeSpecification => FullNameDisplaySignatureProvider.Instance.GetTypeFromSpecification(md, ctx, (TypeSpecificationHandle)handle, 0),
-            _ => string.Empty,
-        };
-    }
-
-    private static string ResolveEntityDisplayName(MetadataReader md, EntityHandle handle, GenericContext ctx)
-    {
-        return handle.Kind switch
-        {
-            HandleKind.TypeDefinition => DisplaySignatureProvider.Instance.GetTypeFromDefinition(md, (TypeDefinitionHandle)handle, 0),
-            HandleKind.TypeReference => DisplaySignatureProvider.Instance.GetTypeFromReference(md, (TypeReferenceHandle)handle, 0),
-            HandleKind.TypeSpecification => DisplaySignatureProvider.Instance.GetTypeFromSpecification(md, ctx, (TypeSpecificationHandle)handle, 0),
-            _ => string.Empty,
-        };
     }
 
     private static string DetermineTypeKind(TypeDefinition td, string? baseFull)
@@ -430,8 +337,19 @@ public static class MetadataExtractor
         return "class";
     }
 
-    private static string DetermineTypeModifiers(TypeDefinition td, string kind)
+    private static string DetermineTypeModifiers(MetadataReader md, TypeDefinition td, string kind)
     {
+        if (kind == "struct")
+        {
+            var attrs = td.GetCustomAttributes();
+            var isReadOnly = ConstantAndAttributeReader.HasAttribute(md, attrs, "System.Runtime.CompilerServices", "IsReadOnlyAttribute");
+            var isByRefLike = ConstantAndAttributeReader.HasAttribute(md, attrs, "System.Runtime.CompilerServices", "IsByRefLikeAttribute");
+            if (isReadOnly && isByRefLike) return "readonly ref";
+            if (isReadOnly) return "readonly";
+            if (isByRefLike) return "ref";
+            return string.Empty;
+        }
+
         if (kind != "class") return string.Empty;
         var isAbs = (td.Attributes & TypeAttributes.Abstract) != 0;
         var isSealed = (td.Attributes & TypeAttributes.Sealed) != 0;
@@ -444,14 +362,17 @@ public static class MetadataExtractor
     private static List<ExtractedMember> ExtractMembers(
         MetadataReader md,
         TypeDefinition td,
+        string bareTypeFullName,
         string clrTypeName,
         string simpleTypeName,
         string typeKind,
         GenericContext typeGenericCtx,
         bool isExtContainer,
         string defaultMemberName,
+        byte typeNullCtx,
         XmlDocBook xmlDocs,
         EnumLookup enumLookup,
+        ReferenceTypeLookup refLookup,
         bool includeNonPublic)
     {
         var members = new List<ExtractedMember>();
@@ -468,7 +389,7 @@ public static class MetadataExtractor
             if (!accessors.Setter.IsNil) accessorMethods.Add(accessors.Setter);
 
             var extracted = ExtractProperty(
-                md, prop, accessors, docTypePrefix, typeGenericCtx, isInterfaceType, defaultMemberName, xmlDocs, includeNonPublic);
+                md, prop, accessors, docTypePrefix, typeGenericCtx, isInterfaceType, defaultMemberName, typeNullCtx, xmlDocs, enumLookup, refLookup, includeNonPublic);
             if (extracted != null) members.Add(extracted);
         }
 
@@ -481,14 +402,14 @@ public static class MetadataExtractor
             if (!accessors.Raiser.IsNil) accessorMethods.Add(accessors.Raiser);
 
             var extracted = ExtractEvent(
-                md, ev, accessors, docTypePrefix, typeGenericCtx, isInterfaceType, xmlDocs, includeNonPublic);
+                md, ev, accessors, docTypePrefix, typeGenericCtx, isInterfaceType, typeNullCtx, xmlDocs, refLookup, includeNonPublic);
             if (extracted != null) members.Add(extracted);
         }
 
         foreach (var fh in td.GetFields())
         {
             var field = md.GetFieldDefinition(fh);
-            var extracted = ExtractField(md, field, typeKind, docTypePrefix, typeGenericCtx, xmlDocs, includeNonPublic);
+            var extracted = ExtractField(md, field, typeKind, docTypePrefix, typeGenericCtx, typeNullCtx, xmlDocs, refLookup, includeNonPublic);
             if (extracted != null) members.Add(extracted);
         }
 
@@ -497,7 +418,7 @@ public static class MetadataExtractor
             if (accessorMethods.Contains(mh)) continue;
             var method = md.GetMethodDefinition(mh);
             var extracted = ExtractMethod(
-                md, method, simpleTypeName, docTypePrefix, typeGenericCtx, isInterfaceType, isExtContainer, xmlDocs, enumLookup, includeNonPublic);
+                md, method, bareTypeFullName, simpleTypeName, docTypePrefix, typeGenericCtx, isInterfaceType, isExtContainer, typeNullCtx, xmlDocs, enumLookup, refLookup, includeNonPublic);
             if (extracted != null) members.Add(extracted);
         }
 
@@ -512,7 +433,10 @@ public static class MetadataExtractor
         GenericContext ctx,
         bool isInterfaceType,
         string defaultMemberName,
+        byte typeNullCtx,
         XmlDocBook xmlDocs,
+        EnumLookup enumLookup,
+        ReferenceTypeLookup refLookup,
         bool includeNonPublic)
     {
         MethodDefinition? getter = accessors.Getter.IsNil ? null : md.GetMethodDefinition(accessors.Getter);
@@ -530,9 +454,11 @@ public static class MetadataExtractor
         var modifiers = primaryMethod.HasValue ? GetMethodModifiers(primaryMethod.Value.Attributes, isInterfaceType) : string.Empty;
 
         MethodSignature<string> dispSig;
+        MethodSignature<IReadOnlyList<(string FullName, string SimpleName)>> refSig;
         try
         {
             dispSig = prop.DecodeSignature(DisplaySignatureProvider.Instance, ctx);
+            refSig = prop.DecodeSignature(TypeRefCollectorProvider.Instance, ctx);
         }
         catch
         {
@@ -547,12 +473,18 @@ public static class MetadataExtractor
             catch { docSig = null; }
         }
 
-        var returnType = dispSig.ReturnType;
-        var returnSimple = ExtractSimpleTypeName(returnType);
+        var (retInfo, paramNames) = primaryMethod.HasValue
+            ? ReadParamMetadata(md, primaryMethod.Value)
+            : (null, new Dictionary<int, ParamInfo>());
+
+        var propNullCtx = (primaryMethod.HasValue ? ConstantAndAttributeReader.ReadNullableContext(md, primaryMethod.Value.GetCustomAttributes()) : null) ?? typeNullCtx;
+        var propNullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, prop.GetCustomAttributes()) ?? retInfo?.NullFlag;
+        var rawRet = ConstantAndAttributeReader.ApplyTopLevelNullability(dispSig.ReturnType, propNullFlag, propNullCtx, refLookup, ctx);
+        var returnType = FormatReturnRefPrefix(rawRet, retInfo);
+        var returnSimple = TypeNameHelper.ExtractSimpleTypeName(dispSig.ReturnType);
 
         var isInit = setter.HasValue && IsInitOnlySetter(md, setter.Value);
         var accessorText = BuildPropertyAccessors(getterAcc, setterAcc, bestAcc, isInit);
-        var paramNames = primaryMethod.HasValue ? ReadParamMetadata(md, primaryMethod.Value) : new Dictionary<int, ParamInfo>();
 
         var sb = new StringBuilder();
         sb.Append(bestAcc).Append(' ');
@@ -561,8 +493,8 @@ public static class MetadataExtractor
 
         var paramSimpleList = new List<string>();
         var typeRefs = new List<MemberTypeRef>();
-        var seenRefs = new HashSet<(string TypeSimple, string Role)>(TypeRefComparer.Instance);
-        AddTypeRefs(typeRefs, seenRefs, returnType, "return", ctx);
+        var seenRefs = new HashSet<(string TypeFull, string Role)>(TypeRefComparer.Instance);
+        AddCollectedRefs(typeRefs, seenRefs, refSig.ReturnType, "return");
 
         string docId;
         if (dispSig.ParameterTypes.Length > 0)
@@ -572,11 +504,18 @@ public static class MetadataExtractor
             for (var i = 0; i < dispSig.ParameterTypes.Length; i++)
             {
                 if (i > 0) sb.Append(", ");
-                var pt = dispSig.ParameterTypes[i];
-                paramSimpleList.Add(ExtractSimpleTypeName(pt));
-                AddTypeRefs(typeRefs, seenRefs, pt, "param", ctx);
                 paramNames.TryGetValue(i + 1, out var pi);
-                sb.Append(pt).Append(' ').Append(string.IsNullOrEmpty(pi?.Name) ? $"arg{i}" : pi.Name);
+                var pt = ConstantAndAttributeReader.ApplyTopLevelNullability(dispSig.ParameterTypes[i], pi?.NullFlag, propNullCtx, refLookup, ctx);
+                if (pi?.IsParams == true) sb.Append("params ");
+                var cleanPt = FormatByRefPrefix(pt, pi, sb);
+                paramSimpleList.Add(TypeNameHelper.ExtractSimpleTypeName(cleanPt));
+                AddCollectedRefs(typeRefs, seenRefs, refSig.ParameterTypes[i], "param");
+                sb.Append(cleanPt).Append(' ').Append(string.IsNullOrEmpty(pi?.Name) ? $"arg{i}" : pi.Name);
+                if (pi?.DefaultValue != null)
+                {
+                    var defText = ConstantAndAttributeReader.FormatDefaultValue(cleanPt, pi.DefaultValue, pi.IsIntegerConst, enumLookup, ctx);
+                    sb.Append(" = ").Append(defText);
+                }
             }
             sb.Append(']');
             docId = docSig.HasValue
@@ -604,6 +543,7 @@ public static class MetadataExtractor
             TypeRefs: typeRefs,
             ExtTargetType: null,
             ExtTargetSimple: null,
+            ExtensionTargets: Array.Empty<ExtensionTargetRef>(),
             EnumValue: null,
             Summary: doc?.Summary,
             ParamsDoc: FormatParamsDoc(doc),
@@ -618,7 +558,9 @@ public static class MetadataExtractor
         string docTypePrefix,
         GenericContext ctx,
         bool isInterfaceType,
+        byte typeNullCtx,
         XmlDocBook xmlDocs,
+        ReferenceTypeLookup refLookup,
         bool includeNonPublic)
     {
         MethodDefinition? adder = accessors.Adder.IsNil ? null : md.GetMethodDefinition(accessors.Adder);
@@ -633,8 +575,10 @@ public static class MetadataExtractor
         var name = md.GetString(ev.Name);
         var primary = adder ?? remover;
         var modifiers = primary.HasValue ? GetMethodModifiers(primary.Value.Attributes, isInterfaceType) : string.Empty;
-        var handlerType = ev.Type.IsNil ? "EventHandler" : ResolveEntityDisplayName(md, ev.Type, ctx);
-        var handlerSimple = ExtractSimpleTypeName(handlerType);
+        var rawHandler = ev.Type.IsNil ? "EventHandler" : TypeNameHelper.ResolveEntityDisplayName(md, ev.Type, ctx);
+        var evNullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, ev.GetCustomAttributes());
+        var handlerType = ConstantAndAttributeReader.ApplyTopLevelNullability(rawHandler, evNullFlag, typeNullCtx, refLookup, ctx);
+        var handlerSimple = TypeNameHelper.ExtractSimpleTypeName(rawHandler);
 
         var sb = new StringBuilder();
         sb.Append(acc).Append(' ');
@@ -645,8 +589,11 @@ public static class MetadataExtractor
         var doc = xmlDocs.Find(docId);
 
         var typeRefs = new List<MemberTypeRef>();
-        var seenRefs = new HashSet<(string TypeSimple, string Role)>(TypeRefComparer.Instance);
-        AddTypeRefs(typeRefs, seenRefs, handlerType, "return", ctx);
+        var seenRefs = new HashSet<(string TypeFull, string Role)>(TypeRefComparer.Instance);
+        var collected = ev.Type.IsNil
+            ? new[] { ("System.EventHandler", "EventHandler") }
+            : TypeRefCollectorProvider.CollectFromEntity(md, ev.Type, ctx);
+        AddCollectedRefs(typeRefs, seenRefs, collected, "return");
 
         return new ExtractedMember(
             Kind: "event",
@@ -660,6 +607,7 @@ public static class MetadataExtractor
             TypeRefs: typeRefs,
             ExtTargetType: null,
             ExtTargetSimple: null,
+            ExtensionTargets: Array.Empty<ExtensionTargetRef>(),
             EnumValue: null,
             Summary: doc?.Summary,
             ParamsDoc: null,
@@ -673,7 +621,9 @@ public static class MetadataExtractor
         string typeKind,
         string docTypePrefix,
         GenericContext ctx,
+        byte typeNullCtx,
         XmlDocBook xmlDocs,
+        ReferenceTypeLookup refLookup,
         bool includeNonPublic)
     {
         var name = md.GetString(field.Name);
@@ -683,9 +633,21 @@ public static class MetadataExtractor
         if (!includeNonPublic && acc is not ("public" or "protected"))
             return null;
 
-        string fieldType;
-        try { fieldType = field.DecodeSignature(DisplaySignatureProvider.Instance, ctx); }
-        catch { return null; }
+        string rawFieldType;
+        IReadOnlyList<(string FullName, string SimpleName)> collectedRefs;
+        try
+        {
+            rawFieldType = field.DecodeSignature(DisplaySignatureProvider.Instance, ctx);
+            collectedRefs = field.DecodeSignature(TypeRefCollectorProvider.Instance, ctx);
+        }
+        catch
+        {
+            return null;
+        }
+
+        var fieldAttrs = field.GetCustomAttributes();
+        var fieldNullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, fieldAttrs);
+        var fieldType = ConstantAndAttributeReader.ApplyTopLevelNullability(rawFieldType, fieldNullFlag, typeNullCtx, refLookup, ctx);
 
         var isLiteral = (field.Attributes & FieldAttributes.Literal) != 0;
         var isStatic = (field.Attributes & FieldAttributes.Static) != 0;
@@ -694,14 +656,21 @@ public static class MetadataExtractor
         string? constVal = null;
         var constHandle = field.GetDefaultValue();
         if (!constHandle.IsNil)
-            constVal = ReadConstantValue(md, md.GetConstant(constHandle));
+        {
+            constVal = ConstantAndAttributeReader.ReadConstantValue(md, md.GetConstant(constHandle));
+        }
+        else if (isStatic && isInitOnly && ConstantAndAttributeReader.TryReadDecimalConstant(md, fieldAttrs, out var decVal))
+        {
+            constVal = decVal;
+            isLiteral = true;
+        }
 
         var docId = $"F:{docTypePrefix}.{name}";
         var doc = xmlDocs.Find(docId);
 
         var typeRefs = new List<MemberTypeRef>();
-        var seenRefs = new HashSet<(string TypeSimple, string Role)>(TypeRefComparer.Instance);
-        AddTypeRefs(typeRefs, seenRefs, fieldType, "return", ctx);
+        var seenRefs = new HashSet<(string TypeFull, string Role)>(TypeRefComparer.Instance);
+        AddCollectedRefs(typeRefs, seenRefs, collectedRefs, "return");
 
         if (typeKind == "enum" && isLiteral)
         {
@@ -712,12 +681,13 @@ public static class MetadataExtractor
                 Accessibility: "public",
                 Modifiers: "const",
                 ReturnType: fieldType,
-                ReturnSimple: ExtractSimpleTypeName(fieldType),
+                ReturnSimple: TypeNameHelper.ExtractSimpleTypeName(rawFieldType),
                 Signature: sig,
                 ParamTypes: string.Empty,
                 TypeRefs: typeRefs,
                 ExtTargetType: null,
                 ExtTargetSimple: null,
+                ExtensionTargets: Array.Empty<ExtensionTargetRef>(),
                 EnumValue: constVal,
                 Summary: doc?.Summary,
                 ParamsDoc: null,
@@ -746,12 +716,13 @@ public static class MetadataExtractor
             Accessibility: acc,
             Modifiers: modText,
             ReturnType: fieldType,
-            ReturnSimple: ExtractSimpleTypeName(fieldType),
+            ReturnSimple: TypeNameHelper.ExtractSimpleTypeName(rawFieldType),
             Signature: sb.ToString(),
             ParamTypes: string.Empty,
             TypeRefs: typeRefs,
             ExtTargetType: null,
             ExtTargetSimple: null,
+            ExtensionTargets: Array.Empty<ExtensionTargetRef>(),
             EnumValue: constVal,
             Summary: doc?.Summary,
             ParamsDoc: null,
@@ -762,13 +733,16 @@ public static class MetadataExtractor
     private static ExtractedMember? ExtractMethod(
         MetadataReader md,
         MethodDefinition method,
+        string bareTypeFullName,
         string simpleTypeName,
         string docTypePrefix,
         GenericContext typeCtx,
         bool isInterfaceType,
         bool isExtContainer,
+        byte typeNullCtx,
         XmlDocBook xmlDocs,
         EnumLookup enumLookup,
+        ReferenceTypeLookup refLookup,
         bool includeNonPublic)
     {
         var name = md.GetString(method.Name);
@@ -783,22 +757,32 @@ public static class MetadataExtractor
         if (!includeNonPublic && acc is not ("public" or "protected"))
             return null;
 
-        var methodGp = ReadGenericParamNames(md, method.GetGenericParameters());
-        var fullCtx = methodGp.Count > 0 ? typeCtx with { MethodParams = methodGp } : typeCtx;
+        var methodGp = TypeNameHelper.ReadGenericParamNames(md, method.GetGenericParameters());
+        var fullCtx = methodGp.Count > 0
+            ? typeCtx with
+            {
+                MethodParams = methodGp,
+                ValueTypeGenericParams = TypeNameHelper.ReadValueTypeGenericParams(md, method.GetGenericParameters(), typeCtx.ValueTypeGenericParams),
+            }
+            : typeCtx;
 
         MethodSignature<string> dispSig;
+        MethodSignature<IReadOnlyList<(string FullName, string SimpleName)>> refSig;
         try
         {
             dispSig = method.DecodeSignature(DisplaySignatureProvider.Instance, fullCtx);
+            refSig = method.DecodeSignature(TypeRefCollectorProvider.Instance, fullCtx);
         }
         catch
         {
             return null;
         }
 
+        var methodAttrs = method.GetCustomAttributes();
+        var methodNullCtx = ConstantAndAttributeReader.ReadNullableContext(md, methodAttrs) ?? typeNullCtx;
         var isStatic = (method.Attributes & MethodAttributes.Static) != 0;
         var isExt = isStatic && isExtContainer && dispSig.ParameterTypes.Length > 0 &&
-                    HasAttribute(md, method.GetCustomAttributes(), "System.Runtime.CompilerServices", "ExtensionAttribute");
+                    ConstantAndAttributeReader.HasAttribute(md, methodAttrs, "System.Runtime.CompilerServices", "ExtensionAttribute");
 
         MethodSignature<string>? docSig = null;
         if (xmlDocs.Count > 0 || isExt)
@@ -807,9 +791,14 @@ public static class MetadataExtractor
             catch { docSig = null; }
         }
 
-        var paramInfos = ReadParamMetadata(md, method);
+        var (retInfo, paramInfos) = ReadParamMetadata(md, method);
         var modifiers = isCtor ? string.Empty : GetMethodModifiers(method.Attributes, isInterfaceType);
         var methodConstraints = methodGp.Count > 0 ? ReadGenericConstraints(md, method.GetGenericParameters(), fullCtx) : string.Empty;
+
+        var rawRet = isCtor
+            ? simpleTypeName
+            : ConstantAndAttributeReader.ApplyTopLevelNullability(dispSig.ReturnType, retInfo?.NullFlag, methodNullCtx, refLookup, fullCtx);
+        var returnType = isCtor ? simpleTypeName : FormatReturnRefPrefix(rawRet, retInfo);
 
         var sb = new StringBuilder();
         sb.Append(acc).Append(' ');
@@ -820,35 +809,37 @@ public static class MetadataExtractor
         }
         else
         {
-            sb.Append(dispSig.ReturnType).Append(' ').Append(name);
+            sb.Append(returnType).Append(' ').Append(name);
             if (methodGp.Count > 0)
                 sb.Append('<').Append(string.Join(", ", methodGp)).Append('>');
         }
 
-        var returnType = isCtor ? simpleTypeName : dispSig.ReturnType;
         var typeRefs = new List<MemberTypeRef>();
-        var seenRefs = new HashSet<(string TypeSimple, string Role)>(TypeRefComparer.Instance);
-        AddTypeRefs(typeRefs, seenRefs, returnType, "return", fullCtx);
+        var seenRefs = new HashSet<(string TypeFull, string Role)>(TypeRefComparer.Instance);
+        if (isCtor)
+            AddCollectedRefs(typeRefs, seenRefs, new[] { (bareTypeFullName, simpleTypeName) }, "return");
+        else
+            AddCollectedRefs(typeRefs, seenRefs, refSig.ReturnType, "return");
 
         sb.Append('(');
         var paramSimpleList = new List<string>(dispSig.ParameterTypes.Length);
         for (var i = 0; i < dispSig.ParameterTypes.Length; i++)
         {
             if (i > 0) sb.Append(", ");
-            var rawPt = dispSig.ParameterTypes[i];
             paramInfos.TryGetValue(i + 1, out var pi);
+            var rawPt = ConstantAndAttributeReader.ApplyTopLevelNullability(dispSig.ParameterTypes[i], pi?.NullFlag, methodNullCtx, refLookup, fullCtx);
 
             if (i == 0 && isExt) sb.Append("this ");
             if (pi?.IsParams == true) sb.Append("params ");
 
             var cleanPt = FormatByRefPrefix(rawPt, pi, sb);
-            paramSimpleList.Add(ExtractSimpleTypeName(cleanPt));
-            AddTypeRefs(typeRefs, seenRefs, cleanPt, "param", fullCtx);
+            paramSimpleList.Add(TypeNameHelper.ExtractSimpleTypeName(cleanPt));
+            AddCollectedRefs(typeRefs, seenRefs, refSig.ParameterTypes[i], "param");
 
             sb.Append(cleanPt).Append(' ').Append(string.IsNullOrEmpty(pi?.Name) ? $"arg{i}" : pi.Name);
             if (pi?.DefaultValue != null)
             {
-                var defText = FormatDefaultValue(cleanPt, pi.DefaultValue, enumLookup);
+                var defText = ConstantAndAttributeReader.FormatDefaultValue(cleanPt, pi.DefaultValue, pi.IsIntegerConst, enumLookup, fullCtx);
                 sb.Append(" = ").Append(defText);
             }
         }
@@ -856,13 +847,14 @@ public static class MetadataExtractor
         if (!string.IsNullOrEmpty(methodConstraints))
             sb.Append(' ').Append(methodConstraints);
 
-        string? extTargetFull = null;
-        string? extTargetSimple = null;
+        IReadOnlyList<ExtensionTargetRef> extTargets = Array.Empty<ExtensionTargetRef>();
         if (isExt && docSig.HasValue && docSig.Value.ParameterTypes.Length > 0)
         {
-            extTargetFull = NormalizeDocTargetType(docSig.Value.ParameterTypes[0]);
-            extTargetSimple = ExtractSimpleTypeName(extTargetFull);
+            extTargets = TypeNameHelper.ResolveExtensionTargets(md, method, docSig.Value.ParameterTypes[0], fullCtx);
         }
+
+        var extTargetFull = extTargets.Count > 0 ? extTargets[0].TargetFull : null;
+        var extTargetSimple = extTargets.Count > 0 ? extTargets[0].TargetSimple : null;
 
         var docMethodName = isCtor ? "#ctor" : name;
         if (methodGp.Count > 0) docMethodName += $"``{methodGp.Count}";
@@ -885,12 +877,13 @@ public static class MetadataExtractor
             Accessibility: acc,
             Modifiers: modifiers,
             ReturnType: returnType,
-            ReturnSimple: ExtractSimpleTypeName(returnType),
+            ReturnSimple: isCtor ? simpleTypeName : TypeNameHelper.ExtractSimpleTypeName(dispSig.ReturnType),
             Signature: sb.ToString(),
             ParamTypes: string.Join("|", paramSimpleList),
             TypeRefs: typeRefs,
             ExtTargetType: extTargetFull,
             ExtTargetSimple: extTargetSimple,
+            ExtensionTargets: extTargets,
             EnumValue: null,
             Summary: doc?.Summary,
             ParamsDoc: FormatParamsDoc(doc),
@@ -898,113 +891,85 @@ public static class MetadataExtractor
             DocId: docId);
     }
 
+    private static string FormatReturnRefPrefix(string rawRet, ParamInfo? retInfo)
+    {
+        if (!rawRet.EndsWith('&')) return rawRet;
+        var clean = rawRet[..^1];
+        return retInfo?.IsReadOnly == true ? $"ref readonly {clean}" : $"ref {clean}";
+    }
+
     private static string FormatByRefPrefix(string rawPt, ParamInfo? pi, StringBuilder sb)
     {
         if (!rawPt.EndsWith('&')) return rawPt;
         var cleanPt = rawPt[..^1];
-        if (pi?.IsOut == true && pi.IsIn != true) sb.Append("out ");
-        else if (pi?.IsIn == true && pi.IsOut != true) sb.Append("in ");
-        else sb.Append("ref ");
+        if (pi?.IsOut == true && pi.IsIn != true)
+            sb.Append("out ");
+        else if (pi?.IsReadOnly == true)
+            sb.Append(pi.IsIn ? "in " : "ref readonly ");
+        else
+            sb.Append("ref ");
         return cleanPt;
     }
 
-    private static string FormatDefaultValue(string paramType, string rawDefault, EnumLookup enumLookup)
-    {
-        var memberName = enumLookup.ResolveMemberName(paramType, rawDefault);
-        return memberName != null ? $"{paramType.TrimEnd('?')}.{memberName}" : rawDefault;
-    }
+    private sealed record ParamInfo(
+        string Name,
+        bool IsOut,
+        bool IsIn,
+        bool IsReadOnly,
+        bool IsParams,
+        byte? NullFlag,
+        string? DefaultValue,
+        bool IsIntegerConst);
 
-    private sealed record ParamInfo(string Name, bool IsOut, bool IsIn, bool IsParams, string? DefaultValue);
-
-    private static Dictionary<int, ParamInfo> ReadParamMetadata(MetadataReader md, MethodDefinition method)
+    private static (ParamInfo? ReturnParam, Dictionary<int, ParamInfo> Params) ReadParamMetadata(MetadataReader md, MethodDefinition method)
     {
+        ParamInfo? returnParam = null;
         var map = new Dictionary<int, ParamInfo>();
+
         foreach (var ph in method.GetParameters())
         {
             var p = md.GetParameter(ph);
-            if (p.SequenceNumber == 0) continue;
+            var attrs = p.GetCustomAttributes();
+            var nullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, attrs);
+            var isReadOnly = ConstantAndAttributeReader.HasAttribute(md, attrs, "System.Runtime.CompilerServices", "IsReadOnlyAttribute")
+                          || ConstantAndAttributeReader.HasAttribute(md, attrs, "System.Runtime.CompilerServices", "RequiresLocationAttribute");
+
+            if (p.SequenceNumber == 0)
+            {
+                returnParam = new ParamInfo(string.Empty, false, false, isReadOnly, false, nullFlag, null, false);
+                continue;
+            }
 
             var pName = md.GetString(p.Name);
             var isOut = (p.Attributes & ParameterAttributes.Out) != 0;
             var isIn = (p.Attributes & ParameterAttributes.In) != 0;
-            var isParams = HasAttribute(md, p.GetCustomAttributes(), "System", "ParamArrayAttribute");
+            var isParams = ConstantAndAttributeReader.HasAttribute(md, attrs, "System", "ParamArrayAttribute");
 
             string? defVal = null;
+            var isIntConst = false;
             if ((p.Attributes & ParameterAttributes.HasDefault) != 0)
             {
                 var ch = p.GetDefaultValue();
-                if (!ch.IsNil) defVal = ReadConstantValue(md, md.GetConstant(ch));
+                if (!ch.IsNil)
+                {
+                    var c = md.GetConstant(ch);
+                    defVal = ConstantAndAttributeReader.ReadConstantValue(md, c);
+                    isIntConst = ConstantAndAttributeReader.IsIntegerConstantType(c.TypeCode);
+                }
+            }
+            else if (ConstantAndAttributeReader.TryReadDecimalConstant(md, attrs, out var decDef))
+            {
+                defVal = decDef;
             }
             else if ((p.Attributes & ParameterAttributes.Optional) != 0)
             {
                 defVal = "default";
             }
 
-            map[p.SequenceNumber] = new ParamInfo(pName, isOut, isIn, isParams, defVal);
+            map[p.SequenceNumber] = new ParamInfo(pName, isOut, isIn, isReadOnly, isParams, nullFlag, defVal, isIntConst);
         }
-        return map;
-    }
 
-    private static string? ReadConstantValue(MetadataReader md, Constant constant)
-    {
-        try
-        {
-            var br = md.GetBlobReader(constant.Value);
-            return constant.TypeCode switch
-            {
-                ConstantTypeCode.NullReference => "null",
-                ConstantTypeCode.Boolean => br.ReadBoolean() ? "true" : "false",
-                ConstantTypeCode.Char => EscapeCharLiteral(br.ReadChar()),
-                ConstantTypeCode.SByte => br.ReadSByte().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.Byte => br.ReadByte().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.Int16 => br.ReadInt16().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.UInt16 => br.ReadUInt16().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.Int32 => br.ReadInt32().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.UInt32 => br.ReadUInt32().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.Int64 => br.ReadInt64().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.UInt64 => br.ReadUInt64().ToString(CultureInfo.InvariantCulture),
-                ConstantTypeCode.Single => br.ReadSingle().ToString("G", CultureInfo.InvariantCulture),
-                ConstantTypeCode.Double => br.ReadDouble().ToString("G", CultureInfo.InvariantCulture),
-                ConstantTypeCode.String => EscapeStringLiteral(br.ReadUTF16(br.Length)),
-                _ => null,
-            };
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static string EscapeCharLiteral(char c) => c switch
-    {
-        '\'' => "'\\''",
-        '\\' => "'\\\\'",
-        '\0' => "'\\0'",
-        '\n' => "'\\n'",
-        '\r' => "'\\r'",
-        '\t' => "'\\t'",
-        _ => $"'{c}'",
-    };
-
-    private static string EscapeStringLiteral(string s)
-    {
-        var sb = new StringBuilder(s.Length + 2);
-        sb.Append('"');
-        foreach (var c in s)
-        {
-            switch (c)
-            {
-                case '\\': sb.Append("\\\\"); break;
-                case '"': sb.Append("\\\""); break;
-                case '\0': sb.Append("\\0"); break;
-                case '\n': sb.Append("\\n"); break;
-                case '\r': sb.Append("\\r"); break;
-                case '\t': sb.Append("\\t"); break;
-                default: sb.Append(c); break;
-            }
-        }
-        sb.Append('"');
-        return sb.ToString();
+        return (returnParam, map);
     }
 
     private static bool IsInitOnlySetter(MetadataReader md, MethodDefinition setter)
@@ -1017,62 +982,6 @@ public static class MetadataExtractor
         {
             return false;
         }
-    }
-
-    private static string? ReadDefaultMemberName(MetadataReader md, TypeDefinition td)
-    {
-        foreach (var ah in td.GetCustomAttributes())
-        {
-            var ca = md.GetCustomAttribute(ah);
-            if (!IsAttributeType(md, ca, "System.Reflection", "DefaultMemberAttribute"))
-                continue;
-            try
-            {
-                var br = md.GetBlobReader(ca.Value);
-                if (br.Length >= 4 && br.ReadUInt16() == 0x0001)
-                    return br.ReadSerializedString();
-            }
-            catch
-            {
-                return null;
-            }
-        }
-        return null;
-    }
-
-    private static bool HasAttribute(
-        MetadataReader md,
-        CustomAttributeHandleCollection attrs,
-        string targetNs,
-        string targetName)
-    {
-        foreach (var ah in attrs)
-        {
-            if (IsAttributeType(md, md.GetCustomAttribute(ah), targetNs, targetName))
-                return true;
-        }
-        return false;
-    }
-
-    private static bool IsAttributeType(MetadataReader md, CustomAttribute ca, string targetNs, string targetName)
-    {
-        EntityHandle typeHandle = default;
-        if (ca.Constructor.Kind == HandleKind.MemberReference)
-            typeHandle = md.GetMemberReference((MemberReferenceHandle)ca.Constructor).Parent;
-        else if (ca.Constructor.Kind == HandleKind.MethodDefinition)
-            typeHandle = md.GetMethodDefinition((MethodDefinitionHandle)ca.Constructor).GetDeclaringType();
-
-        if (typeHandle.Kind == HandleKind.TypeReference)
-        {
-            var tr = md.GetTypeReference((TypeReferenceHandle)typeHandle);
-            return md.GetString(tr.Name) == targetName && md.GetString(tr.Namespace) == targetNs;
-        }
-        if (typeHandle.Kind == HandleKind.TypeDefinition)
-        {
-            var td = md.GetTypeDefinition((TypeDefinitionHandle)typeHandle);
-            return md.GetString(td.Name) == targetName && md.GetString(td.Namespace) == targetNs;
-        }
-        return false;
     }
 
     private static string GetMethodAccessibility(MethodAttributes attrs) => (attrs & MethodAttributes.MemberAccessMask) switch
@@ -1146,160 +1055,30 @@ public static class MetadataExtractor
         return string.Join("\n", doc.Params.Select(kv => $"{kv.Key}: {kv.Value}"));
     }
 
-    private static string NormalizeDocTargetType(string docType)
-    {
-        var s = docType.TrimEnd('@', '*', '[', ']');
-        var brace = s.IndexOf('{');
-        if (brace >= 0) s = s[..brace];
-        return DisplaySignatureProvider.StripGenericArity(s);
-    }
-
-    public static string StripGenerics(string fullName)
-    {
-        if (string.IsNullOrEmpty(fullName) || !fullName.Contains('<'))
-            return fullName;
-
-        var sb = new StringBuilder(fullName.Length);
-        var depth = 0;
-        foreach (var ch in fullName)
-        {
-            if (ch == '<')
-                depth++;
-            else if (ch == '>')
-            {
-                if (depth > 0) depth--;
-            }
-            else if (depth == 0)
-                sb.Append(ch);
-        }
-        return sb.ToString();
-    }
-
-    public static string ExtractSimpleTypeName(string typeName)
-    {
-        if (string.IsNullOrWhiteSpace(typeName)) return string.Empty;
-        var s = typeName.Trim().TrimEnd('?', '&', '*');
-
-        while (s.EndsWith(']'))
-        {
-            var open = s.LastIndexOf('[');
-            if (open < 0) break;
-            s = s[..open].TrimEnd('?', '&', '*');
-        }
-
-        s = StripGenerics(s).TrimEnd('?', '&', '*');
-        var brace = s.IndexOf('{');
-        if (brace >= 0) s = s[..brace];
-        s = DisplaySignatureProvider.StripGenericArity(s);
-
-        var lastSep = s.LastIndexOfAny(new[] { '.', '+' });
-        var simple = lastSep >= 0 ? s[(lastSep + 1)..] : s;
-        return DisplaySignatureProvider.NormalizePrimitiveAlias(simple);
-    }
-
-    public static List<string> ExtractReferencedSimpleTypeNames(string displayType, GenericContext? ctx = null)
-    {
-        var results = new List<string>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        void Collect(ReadOnlySpan<char> span)
-        {
-            var trimmed = span.Trim();
-            if (trimmed.IsEmpty) return;
-
-            var str = trimmed.ToString();
-            var outerSimple = ExtractSimpleTypeName(str);
-            if (!string.IsNullOrEmpty(outerSimple) &&
-                !string.Equals(outerSimple, "void", StringComparison.OrdinalIgnoreCase) &&
-                !IsGenericParamName(outerSimple, ctx) &&
-                seen.Add(outerSimple))
-            {
-                results.Add(outerSimple);
-            }
-
-            var depth = 0;
-            var ltStart = -1;
-            for (var i = 0; i < str.Length; i++)
-            {
-                var ch = str[i];
-                if (ch == '<')
-                {
-                    if (depth == 0) ltStart = i;
-                    depth++;
-                }
-                else if (ch == '>')
-                {
-                    depth--;
-                    if (depth == 0 && ltStart >= 0)
-                    {
-                        var inner = str.AsSpan(ltStart + 1, i - ltStart - 1);
-                        SplitTopLevelArgs(inner, Collect);
-                        ltStart = -1;
-                    }
-                }
-            }
-        }
-
-        Collect(displayType.AsSpan());
-        return results;
-    }
-
-    private delegate void SpanAction(ReadOnlySpan<char> span);
-
-    private static void SplitTopLevelArgs(ReadOnlySpan<char> inner, SpanAction onArg)
-    {
-        var depth = 0;
-        var start = 0;
-        for (var i = 0; i < inner.Length; i++)
-        {
-            var ch = inner[i];
-            if (ch is '<' or '(' or '[') depth++;
-            else if (ch is '>' or ')' or ']') { if (depth > 0) depth--; }
-            else if (ch == ',' && depth == 0)
-            {
-                onArg(inner[start..i]);
-                start = i + 1;
-            }
-        }
-        if (start < inner.Length)
-            onArg(inner[start..]);
-    }
-
-    private static bool IsGenericParamName(string name, GenericContext? ctx)
-    {
-        if (ctx == null) return false;
-        for (var i = 0; i < ctx.TypeParams.Count; i++)
-            if (string.Equals(ctx.TypeParams[i], name, StringComparison.Ordinal)) return true;
-        for (var i = 0; i < ctx.MethodParams.Count; i++)
-            if (string.Equals(ctx.MethodParams[i], name, StringComparison.Ordinal)) return true;
-        return false;
-    }
-
-    private static void AddTypeRefs(
+    private static void AddCollectedRefs(
         List<MemberTypeRef> list,
-        HashSet<(string TypeSimple, string Role)> seen,
-        string displayType,
-        string role,
-        GenericContext ctx)
+        HashSet<(string TypeFull, string Role)> seen,
+        IReadOnlyList<(string FullName, string SimpleName)> refs,
+        string role)
     {
-        foreach (var simple in ExtractReferencedSimpleTypeNames(displayType, ctx))
+        foreach (var (full, simple) in refs)
         {
-            if (seen.Add((simple, role)))
-                list.Add(new MemberTypeRef(simple, role));
+            if (!string.IsNullOrEmpty(simple) && seen.Add((full, role)))
+                list.Add(new MemberTypeRef(full, simple, role));
         }
     }
 
-    private sealed class TypeRefComparer : IEqualityComparer<(string TypeSimple, string Role)>
+    private sealed class TypeRefComparer : IEqualityComparer<(string TypeFull, string Role)>
     {
         public static readonly TypeRefComparer Instance = new();
 
-        public bool Equals((string TypeSimple, string Role) x, (string TypeSimple, string Role) y)
-            => string.Equals(x.TypeSimple, y.TypeSimple, StringComparison.OrdinalIgnoreCase) &&
+        public bool Equals((string TypeFull, string Role) x, (string TypeFull, string Role) y)
+            => string.Equals(x.TypeFull, y.TypeFull, StringComparison.OrdinalIgnoreCase) &&
                string.Equals(x.Role, y.Role, StringComparison.Ordinal);
 
-        public int GetHashCode((string TypeSimple, string Role) obj)
+        public int GetHashCode((string TypeFull, string Role) obj)
             => HashCode.Combine(
-                StringComparer.OrdinalIgnoreCase.GetHashCode(obj.TypeSimple),
+                StringComparer.OrdinalIgnoreCase.GetHashCode(obj.TypeFull),
                 StringComparer.Ordinal.GetHashCode(obj.Role));
     }
 }

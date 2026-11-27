@@ -29,13 +29,13 @@ public class IndexStoreTests : IDisposable
     {
         var dbPath = Path.Combine(_tempDir, dbName ?? "fixture.db");
         var resolved = SourceResolver.Resolve(Array.Empty<string>(), Array.Empty<string>(), new[] { _fixtureDll });
-        var (store, s) = IndexStore.EnsureBuilt(dbPath, "test", resolved, "fixture", false, forceRebuild);
+        var (store, s) = IndexBuilder.EnsureBuilt(dbPath, "test", resolved, "fixture", false, forceRebuild);
         stats = s;
         return store;
     }
 
     [Fact]
-    public void Search_FingerprintCache_ChineseDocs_And_Bm25RankingWork()
+    public void Search_FingerprintCache_ChineseDocs_DotMemberPriority_And_Bm25RankingWork()
     {
         using (var store1 = BuildFixtureStore(out var stats1))
         {
@@ -49,12 +49,20 @@ public class IndexStoreTests : IDisposable
             var docHits = store1.Search("hexadecimal handle");
             Assert.Contains(docHits, h => h.Name == "Handle");
 
-            // Chinese XML doc search
+            // Chinese XML doc search (multi-char & trailing single-char)
             var cnHits = store1.Search("管道");
             Assert.Contains(cnHits, h => h.Name is "ChinesePipeProcessor" or "ComputePipeLength");
 
             var cnMultiHits = store1.Search("三维管道");
             Assert.Contains(cnMultiHits, h => h.Name == "ChinesePipeProcessor");
+
+            var cnTrailingCharHits = store1.Search("器");
+            Assert.Contains(cnTrailingCharHits, h => h.Name == "ChinesePipeProcessor");
+
+            // Type.Member qualified search ranks exact member first
+            var dotHits = store1.Search("SamplePipeSegment.TryGetPort");
+            Assert.NotEmpty(dotHits);
+            Assert.Equal("TryGetPort", dotHits[0].Name);
 
             // bm25 weighting: exact/name match must outrank summary-only match
             var rankHits = store1.Search("rankingtest");
@@ -71,12 +79,14 @@ public class IndexStoreTests : IDisposable
         }
 
         // Force rebuild overwrites existing DB cleanly once prior reader closes
-        using var store3 = BuildFixtureStore(out var stats3, forceRebuild: true);
-        Assert.True(stats3.Rebuilt);
+        using (var store3 = BuildFixtureStore(out var stats3, forceRebuild: true))
+        {
+            Assert.True(stats3.Rebuilt);
+        }
     }
 
     [Fact]
-    public void NamespaceBoundaryAndLikeUnderscoreEscapingWork()
+    public void NamespaceBoundary_NestedPlusResolution_And_LikeUnderscoreEscapingWork()
     {
         using var store = BuildFixtureStore(out _);
 
@@ -87,6 +97,11 @@ public class IndexStoreTests : IDisposable
         var extraHits = store.Search("ExtraFixtureType", kindFilter: "type", namespacePrefix: "ApiLookup.Tests.FixturesExtra");
         Assert.Single(extraHits);
 
+        // Multi-level nested `+` resolution
+        var deepByPlus = store.ResolveType("MiddleBox+DeepLeaf");
+        Assert.Single(deepByPlus);
+        Assert.Equal("ApiLookup.Tests.Fixtures.OuterBox.MiddleBox.DeepLeaf", deepByPlus[0].FullName);
+
         // --member '_' must match literal underscore only (not every member!)
         var factory = store.ResolveType("SamplePipeFactory").Single();
         var underscoreMembers = store.GetMembers(factory.Id, "_");
@@ -95,11 +110,11 @@ public class IndexStoreTests : IDisposable
     }
 
     [Fact]
-    public void Hierarchy_ExtensionMethods_And_ByType_HandleGenericsInterfacesAndAliases()
+    public void Hierarchy_InterfaceInheritance_Extensions_And_QualifiedByTypeWork()
     {
         using var store = BuildFixtureStore(out _);
 
-        // Class + base + extension methods
+        // Class + base + extension methods (including generic constrained extension, excluding array extension!)
         var pipe = store.ResolveType("SamplePipeSegment").Single();
         var chain = store.GetBaseTypeChain(pipe);
         Assert.Single(chain);
@@ -107,35 +122,46 @@ public class IndexStoreTests : IDisposable
 
         var exts = store.GetExtensionMethods(pipe, chain);
         Assert.Contains(exts, e => e.Name == "CreateAutoCADOffScreenDeviceSnapshot");
+        Assert.Contains(exts, e => e.Name == "UpgradeEntityOpen");
+        Assert.DoesNotContain(exts, e => e.Name == "CountSegmentArray");
 
-        // Generic base class chain
-        var pipeContainer = store.ResolveType("SamplePipeContainer").Single();
-        var containerChain = store.GetBaseTypeChain(pipeContainer);
-        Assert.Single(containerChain);
-        Assert.Equal("SampleContainer", containerChain[0].SimpleName);
+        // Interface inheritance chain: IDerivedSampleItem -> ISampleItem
+        var derivedIface = store.ResolveType("IDerivedSampleItem").Single();
+        var ifaceBaseChain = store.GetBaseTypeChain(derivedIface);
+        Assert.Single(ifaceBaseChain);
+        Assert.Equal("ApiLookup.Tests.Fixtures.ISampleItem", ifaceBaseChain[0].FullName);
 
-        // Interface hierarchy: ISampleItem -> SampleItemImpl -> DerivedSampleItemImpl, excluding ISampleItemSource
+        var derivedIfaceHierarchy = store.GetHierarchy(derivedIface);
+        Assert.Contains("ApiLookup.Tests.Fixtures.ISampleItem", derivedIfaceHierarchy.AncestorChain);
+        Assert.Contains(derivedIfaceHierarchy.DerivedTypes, d => d.SimpleName == "SampleItemImpl");
+        Assert.Contains(derivedIfaceHierarchy.DerivedTypes, d => d.SimpleName == "DerivedSampleItemImpl");
+
+        // Interface hierarchy: ISampleItem -> IDerivedSampleItem -> SampleItemImpl -> DerivedSampleItemImpl
         var iSampleItem = store.ResolveType("ISampleItem", namespacePrefix: "ApiLookup.Tests.Fixtures").Single();
         var ifaceHierarchy = store.GetHierarchy(iSampleItem);
+        Assert.Contains(ifaceHierarchy.DerivedTypes, d => d.SimpleName == "IDerivedSampleItem");
         Assert.Contains(ifaceHierarchy.DerivedTypes, d => d.SimpleName == "SampleItemImpl");
         Assert.Contains(ifaceHierarchy.DerivedTypes, d => d.SimpleName == "DerivedSampleItemImpl");
         Assert.DoesNotContain(ifaceHierarchy.DerivedTypes, d => d.SimpleName == "ISampleItemSource");
 
-        // Extension methods on SampleItemImpl include comma-containing IDictionary<string, SamplePipeSegment> and Fixtures.ISampleItem,
-        // and EXCLUDE OtherNs.ISampleItem.GetOtherTag!
+        // Extension methods on SampleItemImpl include transitive parent interface Fixtures.ISampleItem and exclude OtherNs.ISampleItem
         var impl = store.ResolveType("SampleItemImpl").Single();
         var implChain = store.GetBaseTypeChain(impl);
         var implExts = store.GetExtensionMethods(impl, implChain);
-        Assert.Contains(implExts, e => e.Name == "GetFixtureTag");
         Assert.Contains(implExts, e => e.Name == "CountPipeEntries");
         Assert.DoesNotContain(implExts, e => e.Name == "GetOtherTag");
 
-        // Reverse lookup by-type finds generic containers, multi-dim arrays, and primitive aliases
+        // Reverse lookup by-type finds generic containers, multi-dim arrays, primitive aliases, AND disambiguates qualified namespaces
         var producers = store.FindByType("SamplePipeSegment", role: "return");
         Assert.Contains(producers, m => m.Name == "CreateDefaultPipe");
         Assert.Contains(producers, m => m.Name == "CreatePipeBatch");
         Assert.Contains(producers, m => m.Name == "CreatePipeAsync");
         Assert.Contains(producers, m => m.Name == "CreatePipeGrid");
+
+        var qualifiedIfaceRefs = store.FindByType("ApiLookup.Tests.Fixtures.ISampleItem");
+        Assert.Contains(qualifiedIfaceRefs, m => m.Name == "GetItems");
+        Assert.Contains(qualifiedIfaceRefs, m => m.Name == "GetFixtureTag");
+        Assert.DoesNotContain(qualifiedIfaceRefs, m => m.Name == "GetOtherTag");
 
         var stringProducers = store.FindByType("String", role: "return");
         Assert.Contains(stringProducers, m => m.Name == "Describe");
@@ -154,11 +180,17 @@ public class IndexStoreTests : IDisposable
             ("$q", "SamplePipeSegment"), ("$qBare", "SamplePipeSegment"));
         Assert.DoesNotContain(planResolve, p => p.StartsWith("SCAN types", StringComparison.OrdinalIgnoreCase));
 
-        var planByType = store.ExplainQueryPlan(
+        var planByTypeSimple = store.ExplainQueryPlan(
             "SELECT member_id FROM member_type_refs WHERE type_simple = $s AND role = 'return'",
             ("$s", "SamplePipeSegment"));
-        Assert.Contains(planByType, p => p.Contains("USING COVERING INDEX", StringComparison.OrdinalIgnoreCase) ||
-                                         p.Contains("USING INDEX", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(planByTypeSimple, p => p.Contains("USING COVERING INDEX", StringComparison.OrdinalIgnoreCase) ||
+                                               p.Contains("USING INDEX", StringComparison.OrdinalIgnoreCase));
+
+        var planByTypeFull = store.ExplainQueryPlan(
+            "SELECT member_id FROM member_type_refs WHERE type_full = $f AND role = 'return'",
+            ("$f", "ApiLookup.Tests.Fixtures.SamplePipeSegment"));
+        Assert.Contains(planByTypeFull, p => p.Contains("USING COVERING INDEX", StringComparison.OrdinalIgnoreCase) ||
+                                             p.Contains("USING INDEX", StringComparison.OrdinalIgnoreCase));
 
         var planIface = store.ExplainQueryPlan(
             "SELECT type_id FROM type_interfaces WHERE iface_full = $f",
@@ -166,24 +198,29 @@ public class IndexStoreTests : IDisposable
         Assert.DoesNotContain(planIface, p => p.StartsWith("SCAN type_interfaces", StringComparison.OrdinalIgnoreCase));
 
         var planExt = store.ExplainQueryPlan(
-            "SELECT id FROM members WHERE ext_target_simple IN ($s0)",
+            "SELECT member_id FROM extension_targets WHERE target_simple IN ($s0)",
             ("$s0", "SampleBaseEntity"));
-        Assert.DoesNotContain(planExt, p => p.StartsWith("SCAN members", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(planExt, p => p.StartsWith("SCAN extension_targets", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
-    public void IndexCatalog_IsolatedCacheListDropAndPruneWork()
+    public void IndexCatalog_IsolatedCacheSanitizeListDropAndPruneWork()
     {
         var cacheDir = Path.Combine(_tempDir, "cache");
         Directory.CreateDirectory(cacheDir);
         var resolved = SourceResolver.Resolve(Array.Empty<string>(), Array.Empty<string>(), new[] { _fixtureDll });
 
+        // Distinct special-character names must not collide on disk
+        Assert.NotEqual(
+            IndexCatalog.GetNamedIndexPath("sdk/2025", cacheDir),
+            IndexCatalog.GetNamedIndexPath("sdk:2025", cacheDir));
+
         var namedPath = IndexCatalog.GetNamedIndexPath("MySdk", cacheDir);
-        var (s1, _) = IndexStore.EnsureBuilt(namedPath, "MySdk", resolved, "fixture", false, false);
+        var (s1, _) = IndexBuilder.EnsureBuilt(namedPath, "MySdk", resolved, "fixture", false, false);
         s1.Dispose();
 
         var autoPath = IndexCatalog.GetAutoCachePath(resolved.SourceKey, cacheDir);
-        var (s2, _) = IndexStore.EnsureBuilt(autoPath, null, resolved, "fixture", false, false);
+        var (s2, _) = IndexBuilder.EnsureBuilt(autoPath, null, resolved, "fixture", false, false);
         s2.Dispose();
 
         var listed = IndexCatalog.ListIndexes(cacheDir);

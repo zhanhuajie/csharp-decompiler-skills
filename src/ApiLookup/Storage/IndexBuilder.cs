@@ -7,7 +7,7 @@ namespace ApiLookup;
 
 public static class IndexBuilder
 {
-    public const string SchemaVersion = "2";
+    public const string SchemaVersion = "3";
 
     public static (IndexStore Store, IndexStats Stats) EnsureBuilt(
         string dbPath,
@@ -53,19 +53,19 @@ public static class IndexBuilder
             });
 
             var extractWarnings = new ConcurrentBag<string>();
-            var producerTask = Task.Run(() =>
+            var producerTask = Task.Run(async () =>
             {
                 try
                 {
-                    Parallel.ForEach(sources.Assemblies, asm =>
+                    await Parallel.ForEachAsync(sources.Assemblies, async (asm, ct) =>
                     {
                         var localWarnings = new List<string>();
                         var extracted = MetadataExtractor.Extract(asm, includeNonPublic, localWarnings);
                         foreach (var w in localWarnings)
                             extractWarnings.Add(w);
                         if (extracted != null)
-                            channel.Writer.WriteAsync(extracted).AsTask().GetAwaiter().GetResult();
-                    });
+                            await channel.Writer.WriteAsync(extracted, ct).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
                     channel.Writer.Complete();
                 }
                 catch (Exception ex)
@@ -78,7 +78,7 @@ public static class IndexBuilder
             {
                 conn.Open();
                 ExecuteNonQuery(conn, @"
-PRAGMA journal_mode = MEMORY;
+PRAGMA journal_mode = OFF;
 PRAGMA synchronous = OFF;
 PRAGMA temp_store = MEMORY;
 PRAGMA cache_size = -64000;
@@ -212,8 +212,15 @@ CREATE TABLE members (
     doc_id TEXT NOT NULL
 );
 
+CREATE TABLE extension_targets (
+    member_id INTEGER NOT NULL,
+    target_full TEXT NOT NULL COLLATE NOCASE,
+    target_simple TEXT NOT NULL COLLATE NOCASE
+);
+
 CREATE TABLE member_type_refs (
     member_id INTEGER NOT NULL,
+    type_full TEXT NOT NULL COLLATE NOCASE,
     type_simple TEXT NOT NULL COLLATE NOCASE,
     role TEXT NOT NULL
 );
@@ -256,7 +263,10 @@ CREATE INDEX idx_members_name ON members(name);
 CREATE INDEX idx_members_ext_target ON members(ext_target_type);
 CREATE INDEX idx_members_ext_simple ON members(ext_target_simple);
 
+CREATE INDEX idx_extension_targets_lookup ON extension_targets(target_simple, target_full, member_id);
+
 CREATE INDEX idx_member_type_refs_lookup ON member_type_refs(type_simple, role, member_id);
+CREATE INDEX idx_member_type_refs_full ON member_type_refs(type_full, role, member_id);
 ");
     }
 
@@ -367,10 +377,18 @@ VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
         var pMRdoc = memCmd.Parameters.Add("$rdoc", SqliteType.Text);
         var pMDocId = memCmd.Parameters.Add("$docId", SqliteType.Text);
 
+        using var extTargetCmd = conn.CreateCommand();
+        extTargetCmd.Transaction = tx;
+        extTargetCmd.CommandText = "INSERT INTO extension_targets(member_id, target_full, target_simple) VALUES($mid, $tf, $ts);";
+        var pETMid = extTargetCmd.Parameters.Add("$mid", SqliteType.Integer);
+        var pETFull = extTargetCmd.Parameters.Add("$tf", SqliteType.Text);
+        var pETSimple = extTargetCmd.Parameters.Add("$ts", SqliteType.Text);
+
         using var typeRefCmd = conn.CreateCommand();
         typeRefCmd.Transaction = tx;
-        typeRefCmd.CommandText = "INSERT INTO member_type_refs(member_id, type_simple, role) VALUES($mid, $ts, $role);";
+        typeRefCmd.CommandText = "INSERT INTO member_type_refs(member_id, type_full, type_simple, role) VALUES($mid, $tf, $ts, $role);";
         var pRMid = typeRefCmd.Parameters.Add("$mid", SqliteType.Integer);
+        var pRTf = typeRefCmd.Parameters.Add("$tf", SqliteType.Text);
         var pRTs = typeRefCmd.Parameters.Add("$ts", SqliteType.Text);
         var pRRole = typeRefCmd.Parameters.Add("$role", SqliteType.Text);
 
@@ -482,9 +500,18 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         pMDocId.Value = m.DocId;
                         memCmd.ExecuteNonQuery();
 
+                        foreach (var et in m.ExtensionTargets)
+                        {
+                            pETMid.Value = memId;
+                            pETFull.Value = et.TargetFull;
+                            pETSimple.Value = et.TargetSimple;
+                            extTargetCmd.ExecuteNonQuery();
+                        }
+
                         foreach (var tr in m.TypeRefs)
                         {
                             pRMid.Value = memId;
+                            pRTf.Value = tr.TypeFull;
                             pRTs.Value = tr.TypeSimple;
                             pRRole.Value = tr.Role;
                             typeRefCmd.ExecuteNonQuery();

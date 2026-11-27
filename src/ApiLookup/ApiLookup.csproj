@@ -2,12 +2,11 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>apilookup</AssemblyName>
+    <PackageId>ApiLookup</PackageId>
     <RootNamespace>ApiLookup</RootNamespace>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
+    <PackAsTool Condition="'$(PublishSingleFile)' != 'true'">true</PackAsTool>
+    <ToolCommandName>apilookup</ToolCommandName>
   </PropertyGroup>
 
   <ItemGroup>

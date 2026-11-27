@@ -8,7 +8,7 @@
 
 | 技能 | 描述 |
 | --- | --- |
-| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | 基于 `System.Reflection.Metadata` + SQLite FTS5 的离线 .NET API 索引与查询工具。支持全文与驼峰分词搜索、干净的 C# 签名骨架（含继承成员、扩展方法与 XML 注释）、继承树与按类型反查方法。 |
+| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | 基于 `System.Reflection.Metadata` + SQLite FTS5 的离线 .NET API 索引与查询工具。支持全文与驼峰/中文分词搜索、干净的 C# 签名骨架（含可空注解、`ref`/`readonly` 结构体、继承成员、泛型约束扩展方法与 XML 注释）、类/接口继承树、按类型反查方法与类型转发定位。 |
 | [csharp-decompiler](csharp-decompiler/SKILL.md) | 使用 `ilspycmd` 将 .NET IL 程序集（`.dll`、`.exe`）反编译为 C# 源码。仅在需要查看方法体、内部副作用或导出完整项目时使用。 |
 
 ---
@@ -33,7 +33,10 @@
 dotnet test .\ApiLookup.sln -c Release
 ```
 
-Linux/macOS 可直接通过 `dotnet run --project src/ApiLookup -- <参数>` 运行，或使用 `-r linux-x64` / `-r osx-arm64` 发布。
+跨平台运行或全局工具安装：
+- 直接运行：`dotnet run --project src/ApiLookup -- <参数>`
+- 发布单文件：`.\tools\build.ps1 -Runtime linux-x64`（或 `osx-arm64`）
+- 打包为 `.NET Tool`：`dotnet pack src/ApiLookup -c Release -o artifacts && dotnet tool install -g --add-source artifacts ApiLookup`
 
 ---
 
@@ -59,23 +62,23 @@ Linux/macOS 可直接通过 `dotnet run --project src/ApiLookup -- <参数>` 运
 ### 常用查询
 
 ```powershell
-# 全文 + 驼峰分词搜索类型、成员与 XML 摘要
+# 全文 + 驼峰/中文分词搜索类型、成员与 XML 摘要
 apilookup.exe search "offscreen device" --index acad2025
-apilookup.exe search "create ceiling" --index revit2026
+apilookup.exe search "Wall.Create" --index revit2026
 
-# 查看干净的 C# 骨架（支持继承成员 --inherited、扩展方法 --ext、成员过滤 --member、完整文档 --docs）
+# 查看干净的 C# 骨架（支持类/接口继承成员 --inherited、扩展方法 --ext、成员过滤 --member、完整文档 --docs）
 apilookup.exe show DocumentCollection --index acad2025 --ns Autodesk.AutoCAD --ext --member Open
 apilookup.exe show Equipment --index acad2025 --ns Autodesk.ProcessPower.PnP3dObjects --member Port --inherited
 apilookup.exe show Wall --index revit2026 --member Create --docs
 
-# 继承树与按类型反查方法（返回/接收该类型的所有方法与属性）
+# 继承树与按类型反查方法（支持简单类名或完整命名空间限定名）
 apilookup.exe hierarchy Autodesk.ProcessPower.PnP3dObjects.Part --index acad2025
 apilookup.exe by-type DataLinksManager3d --index acad2025
 
-# 零缓存快速定位某个类型所在的 DLL 与命名空间（可配合 --include-nonpublic 扫描 internal 类型）
+# 零缓存快速定位某个类型（含 [TypeForwardedTo] 转发类型）所在的 DLL 与命名空间
 apilookup.exe locate Equipment --project C:\repo\MyApp\MyApp.csproj --list-refs
 
-# 直接查询 .csproj 引用（自动按文件指纹缓存）
+# 直接查询 .csproj 引用（自动展开 Directory.Build.props 宏并按文件指纹缓存）
 apilookup.exe search Asset --project C:\repo\MyApp\MyApp.csproj --list-refs
 ```
 
@@ -86,8 +89,8 @@ apilookup.exe search Asset --project C:\repo\MyApp\MyApp.csproj --list-refs
 当签名与 XML 注释不足以判断内部行为（例如隐藏副作用、原生调用前置条件、弹窗类名）时，再用 `ilspycmd` 反编译具体类型：
 
 ```powershell
-# Windows (PowerShell — ilspycmd 输出在 stderr，务必重定向到文件再读)
-ilspycmd -t <FullNamespace.ClassName> <assembly_path> 2>&1 > "$env:TEMP\MyType.cs"
+# Windows (PowerShell — ilspycmd 源码输出在 stdout，版本提示在 stderr，使用 Out-File 保存为 UTF-8)
+ilspycmd -t <FullNamespace.ClassName> <assembly_path> | Out-File -FilePath "$env:TEMP\MyType.cs" -Encoding utf8
 
 # 导出完整项目
 ilspycmd -p -o <output_directory> <assembly_path>
@@ -117,11 +120,11 @@ Directory.Build.props
 .github/workflows/ci.yml
 src/
   ApiLookup/               # .NET 8 CLI（System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5）
-    Cli/                   # 命令行参数解析
-    Extraction/            # PE 元数据、XML 注释、签名解码、中英文分词与源解析
-    Formatting/            # 文本/JSON 输出格式化与源生成序列化上下文
+    Cli/                   # 命令行参数定义
+    Extraction/            # PE 元数据、常量/可空特性、类型名/签名解码、中英文分词与工程源解析
+    Formatting/            # 文本/JSON 输出格式化与统一 camelCase 源生成序列化上下文
     Models/                # 元数据与查询结果数据模型
-    Storage/               # 缓存目录管理、流式并发建库与索引化 SQLite 查询
+    Storage/               # 缓存目录管理、流式异步建库与索引化 SQLite 查询
   ApiLookup.Tests/         # xUnit 单元测试与集成测试
 tools/
   build.ps1                # 发布 apilookup 到 csharp-definition-lookup/scripts/

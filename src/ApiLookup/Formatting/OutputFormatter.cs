@@ -9,6 +9,16 @@ public static class OutputFormatter
     public static void WriteJson<T>(T value, JsonTypeInfo<T> typeInfo, TextWriter? output = null)
         => (output ?? Console.Out).WriteLine(JsonSerializer.Serialize(value, typeInfo));
 
+    public static void WriteError(string message, int exitCode, bool json, TextWriter? stdout = null, TextWriter? stderr = null)
+    {
+        if (json)
+        {
+            WriteJson(new ErrorJsonResult(message, exitCode), ApiLookupJsonContext.Default.ErrorJsonResult, stdout);
+            return;
+        }
+        (stderr ?? Console.Error).WriteLine($"Error: {message}");
+    }
+
     public static string FormatTypeHeader(TypeRow t)
     {
         var parts = new List<string> { t.Accessibility };
@@ -142,10 +152,11 @@ public static class OutputFormatter
         }
 
         var w = output ?? Console.Out;
-        w.WriteLine($"Multiple types match \"{query}\" ({candidates.Count}). Re-run with full name, --namespace, or --assembly:\n");
+        w.WriteLine($"Multiple types match \"{query}\" ({candidates.Count}). Re-run with full name (or CLR arity like Type`1), --namespace, or --assembly:\n");
         foreach (var t in candidates)
         {
-            w.WriteLine($"  [{t.Kind,-9}] {t.FullName}  ({t.AssemblyName})");
+            var clrHint = t.ClrName != t.FullName ? $" [CLR: {t.ClrName}]" : "";
+            w.WriteLine($"  [{t.Kind,-9}] {t.FullName}{clrHint}  ({t.AssemblyName})");
             if (!string.IsNullOrEmpty(t.Summary))
                 w.WriteLine($"              /// {Truncate(t.Summary, 140)}");
             w.WriteLine($"              Assembly: {t.AssemblyPath}");

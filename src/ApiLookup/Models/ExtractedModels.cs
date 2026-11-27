@@ -4,7 +4,10 @@ namespace ApiLookup;
 public sealed record InterfaceRef(string FullName, string SimpleName);
 
 /// <summary>Normalized type reference appearing in a member's return type or parameters.</summary>
-public sealed record MemberTypeRef(string TypeSimple, string Role);
+public sealed record MemberTypeRef(string TypeFull, string TypeSimple, string Role);
+
+/// <summary>Normalized target type (or generic constraint target) for an extension method.</summary>
+public sealed record ExtensionTargetRef(string TargetFull, string TargetSimple);
 
 /// <summary>Metadata and XML documentation extracted from a single managed assembly.</summary>
 public sealed record ExtractedAssembly(
@@ -54,6 +57,7 @@ public sealed record ExtractedMember(
     IReadOnlyList<MemberTypeRef> TypeRefs,
     string? ExtTargetType,
     string? ExtTargetSimple,
+    IReadOnlyList<ExtensionTargetRef> ExtensionTargets,
     string? EnumValue,
     string? Summary,
     string? ParamsDoc,

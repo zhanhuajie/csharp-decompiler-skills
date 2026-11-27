@@ -54,6 +54,15 @@ public class MetadataExtractorTests
         var extMethod = extType.Members.Single(m => m.Name == "CreateAutoCADOffScreenDeviceSnapshot");
         Assert.Contains("this SampleBaseEntity entity", extMethod.Signature);
         Assert.Equal("SampleBaseEntity", extMethod.ExtTargetSimple);
+
+        // Generic constrained extension method resolves constraint target
+        var genericExt = extType.Members.Single(m => m.Name == "UpgradeEntityOpen");
+        Assert.Equal("SampleBaseEntity", genericExt.ExtTargetSimple);
+        Assert.Contains(genericExt.ExtensionTargets, et => et.TargetFull == "ApiLookup.Tests.Fixtures.SampleBaseEntity");
+
+        // Array extension method preserves [] in target so it does NOT collide with single SamplePipeSegment
+        var arrayExt = extType.Members.Single(m => m.Name == "CountSegmentArray");
+        Assert.Equal("SamplePipeSegment[]", arrayExt.ExtTargetSimple);
     }
 
     [Fact]
@@ -61,7 +70,7 @@ public class MetadataExtractorTests
     {
         var asm = MetadataExtractor.Extract(_fixtureDll)!;
 
-        // Generic container: constraints, init setter, indexer, event, escaped const
+        // Generic container: constraints, nullable T?, init setter, indexer, nullable event, escaped const
         var container = asm.Types.Single(t => t.SimpleName == "SampleContainer");
         Assert.Equal("where T : SampleBaseEntity, IDisposable", container.GenericConstraints);
 
@@ -69,21 +78,22 @@ public class MetadataExtractorTests
         Assert.Equal("where T : SampleBaseEntity, new()", factoryBox.GenericConstraints);
 
         var currentProp = container.Members.Single(m => m.Name == "Current");
+        Assert.Contains("T? Current", currentProp.Signature);
         Assert.Contains("init;", currentProp.Signature);
         Assert.DoesNotContain("set;", currentProp.Signature);
 
         var indexer = container.Members.Single(m => m.Name == "Item");
-        Assert.Contains("this[int index]", indexer.Signature);
+        Assert.Contains("T? this[int index]", indexer.Signature);
 
         var ev = container.Members.Single(m => m.Name == "Changed");
         Assert.Equal("event", ev.Kind);
-        Assert.Contains("event EventHandler Changed", ev.Signature);
+        Assert.Contains("event EventHandler? Changed", ev.Signature);
 
         var constField = container.Members.Single(m => m.Name == "EscapedText");
         Assert.Contains("\\n", constField.Signature);
         Assert.Contains("\\\"quoted\\\"", constField.Signature);
 
-        // Derived generic class: BaseType preserves full type arg without `0, sealed override, <value> doc, enum default
+        // Derived generic class: BaseType preserves full type arg without `0, sealed override, <value> doc, NRT ?, enum default
         var pipeContainer = asm.Types.Single(t => t.SimpleName == "SamplePipeContainer");
         Assert.Equal("ApiLookup.Tests.Fixtures.SampleContainer<ApiLookup.Tests.Fixtures.SamplePipeSegment>", pipeContainer.BaseType);
         Assert.Equal("ApiLookup.Tests.Fixtures.SampleContainer", pipeContainer.BaseBare);
@@ -97,6 +107,7 @@ public class MetadataExtractorTests
         Assert.Contains("where U : struct", processItem.Signature);
 
         var active = pipeContainer.Members.Single(m => m.Name == "Active");
+        Assert.Contains("SamplePipeSegment? Active", active.Signature);
         Assert.Contains("Active pipe segment instance", active.ReturnsDoc);
 
         var normKind = pipeContainer.Members.Single(m => m.Name == "NormalizeKind");
@@ -111,6 +122,40 @@ public class MetadataExtractorTests
         var del = asm.Types.Single(t => t.SimpleName == "SampleFilterHandler");
         Assert.Equal("delegate", del.Kind);
         Assert.Equal("public delegate bool SampleFilterHandler(SampleBaseEntity entity, int depth)", del.DelegateSignature);
+    }
+
+    [Fact]
+    public void Extract_HandlesStructModifiersRefReturnsDecimalConstantsAndFlagsDefaults()
+    {
+        var asm = MetadataExtractor.Extract(_fixtureDll)!;
+
+        var roPoint = asm.Types.Single(t => t.SimpleName == "SampleReadOnlyPoint");
+        Assert.Equal("readonly", roPoint.Modifiers);
+        var ctor = roPoint.Members.Single(m => m.Kind == "ctor");
+        Assert.Contains("in double x", ctor.Signature);
+        var xProp = roPoint.Members.Single(m => m.Name == "X");
+        Assert.StartsWith("public ref readonly double X", xProp.Signature);
+        Assert.DoesNotContain("&", xProp.Signature);
+
+        var refSpan = asm.Types.Single(t => t.SimpleName == "SampleRefSpanReader");
+        Assert.Equal("ref", refSpan.Modifiers);
+        var posProp = refSpan.Members.Single(m => m.Name == "Position");
+        Assert.StartsWith("public ref int Position", posProp.Signature);
+
+        var roRefView = asm.Types.Single(t => t.SimpleName == "SampleReadOnlyRefView");
+        Assert.Equal("readonly ref", roRefView.Modifiers);
+
+        var factory = asm.Types.Single(t => t.SimpleName == "SamplePipeFactory");
+        var decConst = factory.Members.Single(m => m.Name == "DefaultWallThickness");
+        Assert.Equal("const", decConst.Modifiers);
+        Assert.Contains("decimal DefaultWallThickness = 12.75m", decConst.Signature);
+
+        var createDefault = factory.Members.Single(m => m.Name == "CreateDefaultPipe");
+        Assert.Contains("decimal tolerance = 0.05m", createDefault.Signature);
+
+        var openFlags = factory.Members.Single(m => m.Name == "OpenWithFlags");
+        Assert.Contains("SampleAccessFlags.Read | SampleAccessFlags.Write", openFlags.Signature);
+        Assert.Contains("(SamplePipeKind)99", openFlags.Signature);
     }
 
     [Fact]
@@ -143,9 +188,7 @@ public class MetadataExtractorTests
 </doc>");
             var book = XmlDocReader.Load(tmp);
             Assert.Equal("Int overload", book.Find("M:Ns.Foo.Connect(System.Int32,System.Int32)")?.Summary);
-            // Unmatched third 2-arg overload must NOT steal Int overload's doc
             Assert.Null(book.Find("M:Ns.Foo.Connect(System.Double,System.Double)", "M:Ns.Foo.Connect#2"));
-            // Unique arity fallback still works for C++/CLI quirks
             Assert.Equal("Unique arity doc", book.Find("M:Ns.Foo.UniqueMethod(System.Double modopt(IsConst))", "M:Ns.Foo.UniqueMethod#1")?.Summary);
         }
         finally

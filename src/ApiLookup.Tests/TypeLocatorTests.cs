@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using Xunit;
 
@@ -33,7 +34,7 @@ public class TypeLocatorTests
     }
 
     [Fact]
-    public void Locate_RespectsNamespaceBoundaryAndVisibility()
+    public void Locate_RespectsNamespaceBoundaryVisibilityAndTypeForwarders()
     {
         var resolved = SourceResolver.Resolve(Array.Empty<string>(), Array.Empty<string>(), new[] { _fixtureDll });
 
@@ -46,5 +47,23 @@ public class TypeLocatorTests
         var internalHits = TypeLocator.Locate(resolved.Assemblies, "InternalFixtureHelper", includeNonPublic: true);
         Assert.Single(internalHits);
         Assert.Equal("internal", internalHits[0].Accessibility);
+
+        // Facade [TypeForwardedTo] detection on System.Runtime.dll -> System.Private.CoreLib
+        var coreLibPath = typeof(object).Assembly.Location;
+        var runtimeDir = Path.GetDirectoryName(coreLibPath)!;
+        var sysRuntimeFacade = Path.Combine(runtimeDir, "System.Runtime.dll");
+        if (File.Exists(sysRuntimeFacade))
+        {
+            var facadeOnly = SourceResolver.Resolve(Array.Empty<string>(), Array.Empty<string>(), new[] { sysRuntimeFacade });
+            var forwardedHits = TypeLocator.Locate(facadeOnly.Assemblies, "System.String");
+            Assert.Single(forwardedHits);
+            Assert.StartsWith("forwarded ->", forwardedHits[0].Accessibility);
+
+            // When both facade and implementation DLL are scanned, concrete TypeDefinition wins over forwarder stub
+            var both = SourceResolver.Resolve(Array.Empty<string>(), Array.Empty<string>(), new[] { sysRuntimeFacade, coreLibPath });
+            var concreteHits = TypeLocator.Locate(both.Assemblies, "System.String");
+            Assert.Single(concreteHits);
+            Assert.Equal("public", concreteHits[0].Accessibility);
+        }
     }
 }

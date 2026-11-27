@@ -1,5 +1,3 @@
-using System.Text.Json.Serialization;
-
 namespace ApiLookup;
 
 public sealed record IndexStats(
@@ -92,32 +90,32 @@ public sealed record HierarchyResult(
     IReadOnlyList<TypeRow> DerivedTypes);
 
 public sealed record InheritedGroupJson(
-    [property: JsonPropertyName("baseType")] string BaseType,
-    [property: JsonPropertyName("members")] IReadOnlyList<MemberRow> Members);
+    string BaseType,
+    IReadOnlyList<MemberRow> Members);
 
 public sealed record TypeDetailJson(
-    [property: JsonPropertyName("type")] TypeRow Type,
-    [property: JsonPropertyName("members")] IReadOnlyList<MemberRow> Members,
-    [property: JsonPropertyName("inherited")] IReadOnlyList<InheritedGroupJson> Inherited,
-    [property: JsonPropertyName("extensionMethods")] IReadOnlyList<MemberRow> ExtensionMethods);
+    TypeRow Type,
+    IReadOnlyList<MemberRow> Members,
+    IReadOnlyList<InheritedGroupJson> Inherited,
+    IReadOnlyList<MemberRow> ExtensionMethods);
 
 public sealed record SearchJsonResult(
-    [property: JsonPropertyName("assemblies")] IReadOnlyList<AssemblyRow> Assemblies,
-    [property: JsonPropertyName("hits")] IReadOnlyList<SearchHit> Hits);
+    IReadOnlyList<AssemblyRow> Assemblies,
+    IReadOnlyList<SearchHit> Hits);
 
 public sealed record AmbiguousTypesResult(
-    [property: JsonPropertyName("ambiguous")] bool Ambiguous,
-    [property: JsonPropertyName("query")] string Query,
-    [property: JsonPropertyName("candidates")] IReadOnlyList<TypeRow> Candidates);
+    bool Ambiguous,
+    string Query,
+    IReadOnlyList<TypeRow> Candidates);
 
 public sealed record DropIndexResult(
-    [property: JsonPropertyName("name")] string Name,
-    [property: JsonPropertyName("dropped")] bool Dropped);
+    string Name,
+    bool Dropped);
 
 public sealed record PruneResult(
-    [property: JsonPropertyName("removedCount")] int RemovedCount,
-    [property: JsonPropertyName("freedBytes")] long FreedBytes,
-    [property: JsonPropertyName("removedFiles")] IReadOnlyList<string> RemovedFiles);
+    int RemovedCount,
+    long FreedBytes,
+    IReadOnlyList<string> RemovedFiles);
 
 public sealed record LocateHit(
     string FullName,
@@ -130,11 +128,15 @@ public sealed record LocateHit(
     string Group);
 
 public sealed record ResolvedRefGroup(
-    [property: JsonPropertyName("group")] string Group,
-    [property: JsonPropertyName("count")] int Count);
+    string Group,
+    int Count);
 
 public sealed record LocateJsonResult(
-    [property: JsonPropertyName("query")] string Query,
-    [property: JsonPropertyName("scannedAssemblies")] int ScannedAssemblies,
-    [property: JsonPropertyName("references")] IReadOnlyList<ResolvedRefGroup>? References,
-    [property: JsonPropertyName("matches")] IReadOnlyList<LocateHit> Matches);
+    string Query,
+    int ScannedAssemblies,
+    IReadOnlyList<ResolvedRefGroup>? References,
+    IReadOnlyList<LocateHit> Matches);
+
+public sealed record ErrorJsonResult(
+    string Error,
+    int ExitCode);

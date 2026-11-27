@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Enumeration;
 using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
@@ -26,6 +27,8 @@ public static partial class SourceResolver
     [GeneratedRegex(@"\$\(([^)]+)\)")]
     private static partial Regex MsBuildMacroRegex();
 
+    private sealed record CandidateBinary(string FullPath, string Group, string? PrefoundXml);
+
     public static ResolvedSources Resolve(
         IReadOnlyList<string> projectPaths,
         IReadOnlyList<string> dirPaths,
@@ -37,6 +40,7 @@ public static partial class SourceResolver
         string? targetFramework = null)
     {
         var results = new List<ResolvedAssembly>();
+        var candidates = new List<CandidateBinary>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var warnings = new List<string>();
         var keyParts = new List<string>
@@ -62,21 +66,19 @@ public static partial class SourceResolver
             return true;
         }
 
-        void AddDll(string fullPath, string group, bool applyFilters = true, string? prefoundXml = null)
+        void EnqueueCandidate(string fullPath, string group, bool applyFilters = true, string? prefoundXml = null)
         {
             if (!File.Exists(fullPath)) return;
             if (!fullPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) &&
                 !fullPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
                 return;
-            if (fullPath.EndsWith(".resources.dll", StringComparison.OrdinalIgnoreCase))
+            if (fullPath.EndsWith(".resources.dll", StringComparison.OrdinalIgnoreCase) ||
+                fullPath.EndsWith(".vshost.exe", StringComparison.OrdinalIgnoreCase))
                 return;
             if (!MatchesFilters(fullPath, applyFilters)) return;
             if (!seen.Add(fullPath)) return;
-            if (!HasManagedMetadata(fullPath)) return;
 
-            var fi = new FileInfo(fullPath);
-            var xmlPath = prefoundXml ?? XmlDocReader.FindXmlDocPath(fullPath);
-            results.Add(new ResolvedAssembly(fullPath, group, xmlPath, fi.Length, fi.LastWriteTimeUtc.Ticks));
+            candidates.Add(new CandidateBinary(fullPath, group, prefoundXml));
         }
 
         foreach (var raw in dllPaths)
@@ -113,19 +115,15 @@ public static partial class SourceResolver
                 continue;
             }
 
-            IEnumerable<string> files;
             try
             {
-                files = EnumerateDllsSafe(full, recursive);
+                foreach (var file in EnumerateBinariesSafe(full, recursive))
+                    EnqueueCandidate(file, full);
             }
             catch (Exception ex)
             {
                 warnings.Add($"Error scanning directory {full}: {ex.Message}");
-                continue;
             }
-
-            foreach (var file in files)
-                AddDll(file, full);
         }
 
         foreach (var raw in projectPaths)
@@ -138,13 +136,17 @@ public static partial class SourceResolver
                 continue;
             }
 
-            var before = results.Count;
+            var projectCandidates = new List<CandidateBinary>();
             var projectDir = Path.GetDirectoryName(full)!;
             var assetsPath = Path.Combine(projectDir, "obj", "project.assets.json");
             if (File.Exists(assetsPath))
             {
                 foreach (var (dll, group, xmlPath) in ResolveFromAssets(assetsPath, projectDir, targetFramework, warnings))
-                    AddDll(dll, group, prefoundXml: xmlPath);
+                {
+                    var before = candidates.Count;
+                    EnqueueCandidate(dll, group, prefoundXml: xmlPath);
+                    if (candidates.Count > before) projectCandidates.Add(candidates[^1]);
+                }
             }
             else
             {
@@ -152,10 +154,34 @@ public static partial class SourceResolver
             }
 
             foreach (var hintDll in GetCsprojHintPaths(full, warnings))
-                AddDll(hintDll, "HintPath");
+            {
+                var before = candidates.Count;
+                EnqueueCandidate(hintDll, "HintPath");
+                if (candidates.Count > before) projectCandidates.Add(candidates[^1]);
+            }
 
-            if (results.Count == before)
+            if (projectCandidates.Count == 0 && results.Count == 0)
                 warnings.Add($"No managed DLL references found for project: {full}");
+        }
+
+        // Probe candidate PE headers and XML companion docs in parallel for large directories/projects
+        if (candidates.Count <= 8)
+        {
+            foreach (var c in candidates)
+            {
+                var probed = ProbeCandidate(c);
+                if (probed != null) results.Add(probed);
+            }
+        }
+        else
+        {
+            var bag = new ConcurrentBag<ResolvedAssembly>();
+            Parallel.ForEach(candidates, c =>
+            {
+                var probed = ProbeCandidate(c);
+                if (probed != null) bag.Add(probed);
+            });
+            results.AddRange(bag);
         }
 
         results.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Path, b.Path));
@@ -181,18 +207,33 @@ public static partial class SourceResolver
         return new ResolvedSources(results, sourceKey, fingerprint, warnings);
     }
 
-    private static IEnumerable<string> EnumerateDllsSafe(string root, bool recursive)
+    private static ResolvedAssembly? ProbeCandidate(CandidateBinary c)
+    {
+        if (!HasManagedMetadata(c.FullPath)) return null;
+        var fi = new FileInfo(c.FullPath);
+        var xmlPath = c.PrefoundXml ?? XmlDocReader.FindXmlDocPath(c.FullPath);
+        return new ResolvedAssembly(c.FullPath, c.Group, xmlPath, fi.Length, fi.LastWriteTimeUtc.Ticks);
+    }
+
+    private static IEnumerable<string> EnumerateBinariesSafe(string root, bool recursive)
     {
         var stack = new Stack<string>();
         stack.Push(root);
         while (stack.Count > 0)
         {
             var dir = stack.Pop();
-            string[] files;
-            try { files = Directory.GetFiles(dir, "*.dll"); }
+            string[] dlls;
+            try { dlls = Directory.GetFiles(dir, "*.dll"); }
             catch { continue; }
 
-            foreach (var f in files)
+            foreach (var f in dlls)
+                yield return f;
+
+            string[] exes;
+            try { exes = Directory.GetFiles(dir, "*.exe"); }
+            catch { exes = Array.Empty<string>(); }
+
+            foreach (var f in exes)
                 yield return f;
 
             if (!recursive) continue;
@@ -297,6 +338,7 @@ public static partial class SourceResolver
 
             foreach (var tfm in selectedTfms)
             {
+                var preferredShortTfm = ExtractCoreShortTfm(tfm.Name);
                 foreach (var pkg in tfm.Value.EnumerateObject())
                 {
                     var pkgId = pkg.Name;
@@ -307,7 +349,7 @@ public static partial class SourceResolver
 
                     if (pkgType == "project")
                     {
-                        if (TryResolveProjectReferenceDll(libraries, pkgId, projectDir, out var projDll, out var projXml))
+                        if (TryResolveProjectReferenceDll(libraries, pkgId, projectDir, preferredShortTfm, out var projDll, out var projXml))
                             output.Add((projDll, pkgId, projXml));
                         continue;
                     }
@@ -329,11 +371,12 @@ public static partial class SourceResolver
                         foreach (var kv in section.EnumerateObject())
                         {
                             if (!kv.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)) continue;
-                            var full = Path.GetFullPath(Path.Combine(pkgRoot, kv.Name));
+                            var relAsset = NormalizeSeparators(kv.Name);
+                            var full = Path.GetFullPath(Path.Combine(pkgRoot, relAsset));
                             if (!File.Exists(full)) continue;
                             var xml = XmlDocReader.FindXmlDocPath(full);
                             var candidate = new PackageDllCandidate(full, xml, isRuntime);
-                            var fileName = Path.GetFileName(kv.Name);
+                            var fileName = Path.GetFileName(relAsset);
 
                             if (!byFileName.TryGetValue(fileName, out var existing) || IsBetterCandidate(candidate, existing))
                                 byFileName[fileName] = candidate;
@@ -369,6 +412,7 @@ public static partial class SourceResolver
         JsonElement libraries,
         string pkgId,
         string projectDir,
+        string preferredShortTfm,
         out string dllPath,
         out string? xmlPath)
     {
@@ -381,22 +425,59 @@ public static partial class SourceResolver
         else if (lib.TryGetProperty("path", out var lp)) relProj = lp.GetString();
 
         if (string.IsNullOrEmpty(relProj)) return false;
-        var csproj = Path.GetFullPath(Path.Combine(projectDir, relProj));
+        var csproj = Path.GetFullPath(Path.Combine(projectDir, NormalizeSeparators(relProj)));
         var refDir = File.Exists(csproj) ? Path.GetDirectoryName(csproj) : (Directory.Exists(csproj) ? csproj : null);
         if (string.IsNullOrEmpty(refDir)) return false;
 
         var binDir = Path.Combine(refDir, "bin");
         if (!Directory.Exists(binDir)) return false;
 
-        var asmName = Path.GetFileNameWithoutExtension(csproj);
-        var candidates = Directory.GetFiles(binDir, asmName + ".dll", SearchOption.AllDirectories)
-            .OrderByDescending(f => File.GetLastWriteTimeUtc(f))
+        var asmName = ReadCsprojAssemblyName(csproj) ?? Path.GetFileNameWithoutExtension(csproj);
+        var targetFileName = asmName + ".dll";
+
+        var candidates = Directory.EnumerateFiles(binDir, "*.dll", SearchOption.AllDirectories)
+            .Where(f => string.Equals(Path.GetFileName(f), targetFileName, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(f => PathContainsTfmSegment(f, preferredShortTfm) ? 1 : 0)
+            .ThenByDescending(File.GetLastWriteTimeUtc)
             .ToList();
         if (candidates.Count == 0) return false;
 
         dllPath = candidates[0];
         xmlPath = XmlDocReader.FindXmlDocPath(dllPath);
         return true;
+    }
+
+    private static string? ReadCsprojAssemblyName(string csprojPath)
+    {
+        if (!File.Exists(csprojPath)) return null;
+        try
+        {
+            var doc = XDocument.Load(csprojPath);
+            var el = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "AssemblyName" && !string.IsNullOrWhiteSpace(e.Value));
+            var val = el?.Value.Trim();
+            if (!string.IsNullOrEmpty(val) && !MsBuildMacroRegex().IsMatch(val))
+                return val;
+        }
+        catch
+        {
+            // Fall back to project filename
+        }
+        return null;
+    }
+
+    private static bool PathContainsTfmSegment(string fullPath, string shortTfm)
+    {
+        if (string.IsNullOrEmpty(shortTfm)) return false;
+        var parts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return parts.Any(p => p.Equals(shortTfm, StringComparison.OrdinalIgnoreCase) ||
+                              p.StartsWith(shortTfm + "-", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string ExtractCoreShortTfm(string tfmKey)
+    {
+        var s = ToShortTfm(tfmKey);
+        var slash = s.IndexOf('/');
+        return slash >= 0 ? s[..slash] : s;
     }
 
     internal static bool MatchesTfm(string tfmKey, string requested)
@@ -479,8 +560,10 @@ public static partial class SourceResolver
             XNamespace msbuild = "http://schemas.microsoft.com/developer/msbuild/2003";
             var doc = XDocument.Load(csprojPath);
             var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
-            var dirWithSep = dir.EndsWith(Path.DirectorySeparatorChar) ? dir : dir + Path.DirectorySeparatorChar;
+            var dirWithSep = EnsureTrailingSeparator(dir);
             var solutionDir = FindSolutionDir(dir);
+
+            var props = CollectMsBuildProperties(dir, doc, dirWithSep, solutionDir);
 
             var hintPaths = doc.Descendants(msbuild + "HintPath")
                 .Concat(doc.Descendants("HintPath"))
@@ -490,12 +573,13 @@ public static partial class SourceResolver
 
             foreach (var rawHp in hintPaths)
             {
-                var hp = ExpandKnownMacros(rawHp!, dirWithSep, solutionDir);
+                var hp = ExpandProperties(rawHp!, props);
                 if (MsBuildMacroRegex().IsMatch(hp))
                 {
                     warnings.Add($"Skipped HintPath with unresolved MSBuild macro: {rawHp}");
                     continue;
                 }
+                hp = NormalizeSeparators(hp);
                 var full = Path.IsPathRooted(hp) ? Path.GetFullPath(hp) : Path.GetFullPath(Path.Combine(dir, hp));
                 if (File.Exists(full)) refs.Add(full);
             }
@@ -507,24 +591,97 @@ public static partial class SourceResolver
         return refs;
     }
 
-    private static string ExpandKnownMacros(string input, string projectDirWithSep, string? solutionDirWithSep)
+    private static Dictionary<string, string> CollectMsBuildProperties(
+        string projectDir,
+        XDocument csprojDoc,
+        string projectDirWithSep,
+        string? solutionDirWithSep)
     {
-        return MsBuildMacroRegex().Replace(input, match =>
+        var props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            var name = match.Groups[1].Value.Trim();
-            if (name.Equals("ProjectDir", StringComparison.OrdinalIgnoreCase) ||
-                name.Equals("MSBuildProjectDirectory", StringComparison.OrdinalIgnoreCase) ||
-                name.Equals("MSBuildThisFileDirectory", StringComparison.OrdinalIgnoreCase))
+            ["ProjectDir"] = projectDirWithSep,
+            ["MSBuildProjectDirectory"] = projectDirWithSep,
+            ["MSBuildThisFileDirectory"] = projectDirWithSep,
+        };
+        if (solutionDirWithSep != null)
+            props["SolutionDir"] = solutionDirWithSep;
+
+        // Collect ancestor Directory.Build.props from outermost to innermost
+        var buildPropsFiles = new List<string>();
+        var cur = new DirectoryInfo(projectDir);
+        while (cur != null)
+        {
+            var candidate = Path.Combine(cur.FullName, "Directory.Build.props");
+            if (File.Exists(candidate))
+                buildPropsFiles.Add(candidate);
+            cur = cur.Parent;
+        }
+        buildPropsFiles.Reverse();
+
+        foreach (var bpFile in buildPropsFiles)
+        {
+            try
             {
-                return projectDirWithSep;
+                var bpDir = EnsureTrailingSeparator(Path.GetDirectoryName(bpFile)!);
+                props["MSBuildThisFileDirectory"] = bpDir;
+                LoadPropertiesFromXml(XDocument.Load(bpFile), props);
             }
-            if (name.Equals("SolutionDir", StringComparison.OrdinalIgnoreCase) && solutionDirWithSep != null)
+            catch
             {
-                return solutionDirWithSep;
+                // Ignore malformed ancestor Directory.Build.props
             }
-            return match.Value;
-        });
+        }
+
+        props["MSBuildThisFileDirectory"] = projectDirWithSep;
+        LoadPropertiesFromXml(csprojDoc, props);
+        return props;
     }
+
+    private static void LoadPropertiesFromXml(XDocument doc, Dictionary<string, string> props)
+    {
+        var propGroups = doc.Descendants().Where(e => e.Name.LocalName == "PropertyGroup");
+        // Apply unconditional properties first, then conditional properties as fallbacks if unset
+        foreach (var pg in propGroups)
+        {
+            var groupConditional = pg.Attribute("Condition") != null;
+            foreach (var el in pg.Elements())
+            {
+                var key = el.Name.LocalName;
+                if (el.HasElements) continue;
+                var val = el.Value?.Trim();
+                if (string.IsNullOrEmpty(val)) continue;
+
+                var isConditional = groupConditional || el.Attribute("Condition") != null;
+                if (!isConditional || !props.ContainsKey(key))
+                    props[key] = ExpandProperties(val, props);
+            }
+        }
+    }
+
+    private static string ExpandProperties(string input, IReadOnlyDictionary<string, string> props)
+    {
+        var current = input;
+        for (var pass = 0; pass < 3; pass++)
+        {
+            var next = MsBuildMacroRegex().Replace(current, match =>
+            {
+                var name = match.Groups[1].Value.Trim();
+                if (props.TryGetValue(name, out var val))
+                    return val;
+                var env = Environment.GetEnvironmentVariable(name);
+                return !string.IsNullOrEmpty(env) ? env : match.Value;
+            });
+            if (next == current) break;
+            current = next;
+        }
+        return current;
+    }
+
+    private static string EnsureTrailingSeparator(string dir)
+        => dir.EndsWith(Path.DirectorySeparatorChar) ? dir : dir + Path.DirectorySeparatorChar;
+
+    private static string NormalizeSeparators(string path)
+        => Path.DirectorySeparatorChar == '/' ? path.Replace('\\', '/') : path.Replace('/', '\\');
 
     private static string? FindSolutionDir(string startDir)
     {
@@ -532,10 +689,7 @@ public static partial class SourceResolver
         while (current != null)
         {
             if (current.EnumerateFiles("*.sln").Any() || current.EnumerateFiles("*.slnx").Any())
-            {
-                var p = current.FullName;
-                return p.EndsWith(Path.DirectorySeparatorChar) ? p : p + Path.DirectorySeparatorChar;
-            }
+                return EnsureTrailingSeparator(current.FullName);
             current = current.Parent;
         }
         return null;

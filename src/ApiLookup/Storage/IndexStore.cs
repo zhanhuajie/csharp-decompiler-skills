@@ -41,31 +41,17 @@ JOIN assemblies a ON a.id = m.assembly_id";
         _conn = conn;
     }
 
-    public static string DefaultCacheDirectory() => IndexCatalog.DefaultCacheDirectory();
-    public static string GetNamedIndexPath(string name) => IndexCatalog.GetNamedIndexPath(name);
-    public static string GetAutoCachePath(string sourceKey) => IndexCatalog.GetAutoCachePath(sourceKey);
-    public static string ResolveDbPath(string? indexName, string? explicitDbPath, string? sourceKey)
-        => IndexCatalog.ResolveDbPath(indexName, explicitDbPath, sourceKey);
-    public static IReadOnlyList<IndexInfo> ListIndexes() => IndexCatalog.ListIndexes();
-    public static bool DropNamedIndex(string name) => IndexCatalog.DropNamedIndex(name);
-    public static PruneResult PruneAutoIndexes() => IndexCatalog.PruneAutoIndexes();
-
-    public static (IndexStore Store, IndexStats Stats) EnsureBuilt(
-        string dbPath,
-        string? indexName,
-        ResolvedSources sources,
-        string sourceDescription,
-        bool includeNonPublic,
-        bool forceRebuild,
-        List<string>? warnings = null)
-        => IndexBuilder.EnsureBuilt(dbPath, indexName, sources, sourceDescription, includeNonPublic, forceRebuild, warnings);
-
     public static IndexStore OpenReadOnly(string dbPath)
     {
         if (!File.Exists(dbPath))
             throw new FileNotFoundException($"Index database not found: {dbPath}", dbPath);
         var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly;Pooling=False");
         conn.Open();
+        using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA temp_store = MEMORY;";
+            pragma.ExecuteNonQuery();
+        }
         return new IndexStore(dbPath, conn);
     }
 
@@ -95,11 +81,12 @@ SELECT
     CASE
         WHEN LOWER(f.name) = LOWER($exact) AND f.entity_type = 'type' THEN 0
         WHEN LOWER(f.full_name) = LOWER($exact) THEN 1
-        WHEN LOWER(f.name) = LOWER($exact) THEN 2
-        WHEN LOWER(f.name) LIKE LOWER($prefix) ESCAPE '\' AND f.entity_type = 'type' THEN 3
-        WHEN LOWER(f.name) LIKE LOWER($prefix) ESCAPE '\' THEN 4
-        WHEN f.entity_type = 'type' THEN 5
-        ELSE 6
+        WHEN LOWER(f.full_name) LIKE LOWER($dotSuffix) ESCAPE '\' THEN 2
+        WHEN LOWER(f.name) = LOWER($exact) THEN 3
+        WHEN LOWER(f.name) LIKE LOWER($prefix) ESCAPE '\' AND f.entity_type = 'type' THEN 4
+        WHEN LOWER(f.name) LIKE LOWER($prefix) ESCAPE '\' THEN 5
+        WHEN f.entity_type = 'type' THEN 6
+        ELSE 7
     END AS priority
 FROM fts_entries f
 WHERE fts_entries MATCH $fts";
@@ -116,8 +103,10 @@ WHERE fts_entries MATCH $fts";
 
         using var cmd = _conn.CreateCommand();
         var trimmedQuery = query.Trim();
+        var normalizedDotQuery = trimmedQuery.Replace('+', '.');
         cmd.Parameters.AddWithValue("$fts", ftsQuery);
-        cmd.Parameters.AddWithValue("$exact", trimmedQuery);
+        cmd.Parameters.AddWithValue("$exact", normalizedDotQuery);
+        cmd.Parameters.AddWithValue("$dotSuffix", "%." + EscapeLike(normalizedDotQuery));
         cmd.Parameters.AddWithValue("$prefix", EscapeLike(trimmedQuery) + "%");
         cmd.Parameters.AddWithValue("$limit", limit);
 
@@ -194,16 +183,17 @@ WHERE fts_entries MATCH $fts";
     public IReadOnlyList<TypeRow> ResolveType(string query, string? namespacePrefix = null, string? assemblyFilter = null)
     {
         var q = query.Trim();
-        var qBare = MetadataExtractor.StripGenerics(q);
+        var qBare = TypeNameHelper.StripGenerics(q);
+        var qDot = qBare.Replace('+', '.');
 
         // 1. Indexed exact match on full_name, bare_full_name, or clr_name (COLLATE NOCASE)
         var exact = QueryTypes(
             TypeSelectColumns + @"
-WHERE (t.full_name = $q OR t.bare_full_name = $qBare OR t.clr_name = $q)",
+WHERE (t.full_name = $q OR t.bare_full_name = $qDot OR t.clr_name = $q)",
             cmd =>
             {
                 cmd.Parameters.AddWithValue("$q", q);
-                cmd.Parameters.AddWithValue("$qBare", qBare);
+                cmd.Parameters.AddWithValue("$qDot", qDot);
             },
             namespacePrefix,
             assemblyFilter);
@@ -225,12 +215,21 @@ WHERE (t.simple_name = $qBare OR t.name = $q)",
             if (bySimple.Count > 0) return bySimple;
         }
 
-        // 3. Suffix match (e.g. "PnP3dObjects.Equipment" or "Outer.Inner" or "Outer+Inner")
-        var suffixPattern = "%." + EscapeLike(qBare);
+        // 3. Suffix match (e.g. "PnP3dObjects.Equipment", "Outer.Inner", "Outer+Inner", or multi-level "Middle+Inner")
+        var suffixDot = "%." + EscapeLike(qDot);
+        var suffixClrDot = "%." + EscapeLike(qBare);
+        var suffixClrPlus = "%+" + EscapeLike(qBare);
         return QueryTypes(
             TypeSelectColumns + @"
-WHERE (t.bare_full_name LIKE $suffix ESCAPE '\' OR t.clr_name LIKE $suffix ESCAPE '\')",
-            cmd => cmd.Parameters.AddWithValue("$suffix", suffixPattern),
+WHERE (t.bare_full_name LIKE $suffixDot ESCAPE '\'
+    OR t.clr_name LIKE $suffixClrDot ESCAPE '\'
+    OR t.clr_name LIKE $suffixClrPlus ESCAPE '\')",
+            cmd =>
+            {
+                cmd.Parameters.AddWithValue("$suffixDot", suffixDot);
+                cmd.Parameters.AddWithValue("$suffixClrDot", suffixClrDot);
+                cmd.Parameters.AddWithValue("$suffixClrPlus", suffixClrPlus);
+            },
             namespacePrefix,
             assemblyFilter);
     }
@@ -288,13 +287,17 @@ END, m.id ASC";
 
     public List<TypeRow> GetBaseTypeChain(TypeRow target, int maxDepth = 16)
     {
+        if (target.Kind.Equals("interface", StringComparison.OrdinalIgnoreCase))
+            return GetParentInterfaceChain(target, maxDepth);
+
         var chain = new List<TypeRow>();
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.BareFullName };
         var currentBase = target.BaseType;
+        var currentAsmPath = target.AssemblyPath;
 
         for (var i = 0; i < maxDepth && !string.IsNullOrEmpty(currentBase); i++)
         {
-            var bareBase = MetadataExtractor.StripGenerics(currentBase);
+            var bareBase = TypeNameHelper.StripGenerics(currentBase);
             if (bareBase is "System.Object" or "System.ValueType" or "System.Enum" or "System.MulticastDelegate" or "System.Delegate")
                 break;
 
@@ -303,12 +306,49 @@ END, m.id ASC";
             var matches = ResolveType(bareBase);
             if (matches.Count == 0) break;
 
-            var baseRow = matches[0];
+            var baseRow = PickPreferredAssemblyMatch(matches, currentAsmPath);
             chain.Add(baseRow);
             currentBase = baseRow.BaseType;
+            currentAsmPath = baseRow.AssemblyPath;
         }
         return chain;
     }
+
+    private List<TypeRow> GetParentInterfaceChain(TypeRow target, int maxDepth)
+    {
+        var chain = new List<TypeRow>();
+        var visitedIds = new HashSet<long> { target.Id };
+        var queue = new Queue<(TypeRow Row, int Depth)>();
+        queue.Enqueue((target, 0));
+
+        while (queue.Count > 0)
+        {
+            var (cur, depth) = queue.Dequeue();
+            if (depth >= maxDepth) continue;
+
+            foreach (var (ifaceFull, ifaceSimple) in LoadInterfacesForTypes(new List<long> { cur.Id }))
+            {
+                var query = !string.IsNullOrEmpty(ifaceFull) ? ifaceFull : ifaceSimple;
+                if (string.IsNullOrEmpty(query)) continue;
+
+                var matches = ResolveType(query);
+                if (matches.Count == 0) continue;
+
+                var parentRow = PickPreferredAssemblyMatch(matches, cur.AssemblyPath);
+                if (visitedIds.Add(parentRow.Id))
+                {
+                    chain.Add(parentRow);
+                    queue.Enqueue((parentRow, depth + 1));
+                }
+            }
+        }
+
+        return chain;
+    }
+
+    private static TypeRow PickPreferredAssemblyMatch(IReadOnlyList<TypeRow> matches, string preferredAssemblyPath)
+        => matches.FirstOrDefault(m => string.Equals(m.AssemblyPath, preferredAssemblyPath, StringComparison.OrdinalIgnoreCase))
+           ?? matches[0];
 
     public IReadOnlyList<MemberRow> GetExtensionMethods(TypeRow target, IReadOnlyList<TypeRow> baseChain, string? memberFilter = null)
     {
@@ -337,13 +377,20 @@ END, m.id ASC";
         if (targetSimples.Count == 0) return Array.Empty<MemberRow>();
 
         var simpleParams = targetSimples.Select((_, i) => $"$s{i}").ToList();
-        var sql = MemberSelectColumns + $@"
-WHERE m.ext_target_simple IN ({string.Join(", ", simpleParams)})";
+        var sql = $@"
+SELECT m.id, m.type_id, t.full_name, t.simple_name, a.name, a.path, m.kind, m.name, m.accessibility,
+       m.modifiers, m.return_type, m.signature, m.ext_target_type, m.enum_value, m.summary, m.params_doc, m.returns_doc,
+       et.target_full
+FROM extension_targets et
+JOIN members m ON m.id = et.member_id
+JOIN types t ON t.id = m.type_id
+JOIN assemblies a ON a.id = m.assembly_id
+WHERE et.target_simple IN ({string.Join(", ", simpleParams)})";
 
         if (!string.IsNullOrWhiteSpace(memberFilter))
             sql += @" AND m.name LIKE $mf ESCAPE '\'";
 
-        sql += " ORDER BY t.full_name ASC, m.name ASC LIMIT 200";
+        sql += " ORDER BY t.full_name ASC, m.name ASC LIMIT 300";
 
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = sql;
@@ -354,20 +401,21 @@ WHERE m.ext_target_simple IN ({string.Join(", ", simpleParams)})";
             cmd.Parameters.AddWithValue("$mf", "%" + EscapeLike(memberFilter.Trim()) + "%");
 
         var list = new List<MemberRow>();
+        var seenMemberIds = new HashSet<long>();
         using var r = cmd.ExecuteReader();
-        while (r.Read())
+        while (r.Read() && list.Count < 200)
         {
+            var matchedTargetFull = r.GetString(17);
+            if (matchedTargetFull.Contains('.'))
+            {
+                var extBare = TypeNameHelper.StripGenerics(matchedTargetFull);
+                if (!targetFulls.Contains(extBare))
+                    continue;
+            }
+
             var row = ReadMemberRow(r);
-            if (row.ExtTargetType != null && row.ExtTargetType.Contains('.'))
-            {
-                var extBare = MetadataExtractor.StripGenerics(row.ExtTargetType);
-                if (targetFulls.Contains(extBare))
-                    list.Add(row);
-            }
-            else
-            {
+            if (seenMemberIds.Add(row.Id))
                 list.Add(row);
-            }
         }
         return list;
     }
@@ -375,17 +423,28 @@ WHERE m.ext_target_simple IN ({string.Join(", ", simpleParams)})";
     public HierarchyResult GetHierarchy(TypeRow target, int limit = 100)
     {
         var ancestors = new List<string>();
-        var currentBase = target.BaseType;
-        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.BareFullName };
-
-        for (var i = 0; i < 16 && !string.IsNullOrEmpty(currentBase); i++)
+        if (target.Kind.Equals("interface", StringComparison.OrdinalIgnoreCase))
         {
-            ancestors.Add(currentBase);
-            var bare = MetadataExtractor.StripGenerics(currentBase);
-            if (!visited.Add(bare)) break;
-            var matches = ResolveType(bare);
-            if (matches.Count == 0) break;
-            currentBase = matches[0].BaseType;
+            foreach (var parentIface in GetParentInterfaceChain(target, maxDepth: 16))
+                ancestors.Add(parentIface.FullName);
+        }
+        else
+        {
+            var currentBase = target.BaseType;
+            var currentAsmPath = target.AssemblyPath;
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.BareFullName };
+
+            for (var i = 0; i < 16 && !string.IsNullOrEmpty(currentBase); i++)
+            {
+                ancestors.Add(currentBase);
+                var bare = TypeNameHelper.StripGenerics(currentBase);
+                if (!visited.Add(bare)) break;
+                var matches = ResolveType(bare);
+                if (matches.Count == 0) break;
+                var preferred = PickPreferredAssemblyMatch(matches, currentAsmPath);
+                currentBase = preferred.BaseType;
+                currentAsmPath = preferred.AssemblyPath;
+            }
         }
 
         var derived = new List<TypeRow>();
@@ -444,26 +503,45 @@ ORDER BY t.full_name ASC LIMIT $rem";
         string? assemblyFilter = null,
         int limit = 40)
     {
-        var simple = MetadataExtractor.ExtractSimpleTypeName(typeName);
+        var decorated = TypeNameHelper.StripTypeDecorations(typeName);
+        if (string.IsNullOrEmpty(decorated)) return Array.Empty<MemberRow>();
+
+        var isQualified = decorated.Contains('.') || decorated.Contains('+');
+        var normalizedFull = decorated.Replace('+', '.');
+        var simple = TypeNameHelper.ExtractSimpleTypeName(decorated);
         if (string.IsNullOrEmpty(simple)) return Array.Empty<MemberRow>();
 
         var normalizedRole = role.ToLowerInvariant();
+        using var cmd = _conn.CreateCommand();
+
         var sql = @"
 SELECT m.id, m.type_id, t.full_name, t.simple_name, a.name, a.path, m.kind, m.name, m.accessibility,
        m.modifiers, m.return_type, m.signature, m.ext_target_type, m.enum_value, m.summary, m.params_doc, m.returns_doc
 FROM member_type_refs r
 JOIN members m ON m.id = r.member_id
 JOIN types t ON t.id = m.type_id
-JOIN assemblies a ON a.id = m.assembly_id
+JOIN assemblies a ON a.id = m.assembly_id";
+
+        if (isQualified)
+        {
+            sql += @"
+WHERE (r.type_full = $fullExact OR (r.type_simple = $simple AND r.type_full LIKE $fullSuffix ESCAPE '\'))";
+            cmd.Parameters.AddWithValue("$fullExact", normalizedFull);
+            cmd.Parameters.AddWithValue("$simple", simple);
+            cmd.Parameters.AddWithValue("$fullSuffix", "%." + EscapeLike(normalizedFull));
+        }
+        else
+        {
+            sql += @"
 WHERE r.type_simple = $simple";
+            cmd.Parameters.AddWithValue("$simple", simple);
+        }
 
         if (normalizedRole == "return")
             sql += " AND r.role = 'return'";
         else if (normalizedRole == "param")
             sql += " AND r.role = 'param'";
 
-        using var cmd = _conn.CreateCommand();
-        cmd.Parameters.AddWithValue("$simple", simple);
         AppendTypeFilters(ref sql, cmd, namespacePrefix, assemblyFilter);
 
         if (normalizedRole == "both")

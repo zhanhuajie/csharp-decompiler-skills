@@ -4,6 +4,7 @@ namespace ApiLookup;
 
 [JsonSourceGenerationOptions(
     WriteIndented = true,
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(IndexStats))]
 [JsonSerializable(typeof(IReadOnlyList<IndexInfo>))]
@@ -17,6 +18,7 @@ namespace ApiLookup;
 [JsonSerializable(typeof(DropIndexResult))]
 [JsonSerializable(typeof(PruneResult))]
 [JsonSerializable(typeof(LocateJsonResult))]
+[JsonSerializable(typeof(ErrorJsonResult))]
 public partial class ApiLookupJsonContext : JsonSerializerContext
 {
 }
