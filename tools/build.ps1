@@ -40,5 +40,5 @@ $dst = Join-Path $outDir $exeName
 Copy-Item -LiteralPath $built -Destination $dst -Force
 $sizeMb = [Math]::Round((Get-Item -LiteralPath $dst).Length / 1MB, 2)
 Write-Host "Published: $dst ($sizeMb MB)" -ForegroundColor Green
-& $dst --version
+& $dst --version --verbose
 if ($LASTEXITCODE -ne 0) { throw "Published binary verification failed" }

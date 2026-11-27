@@ -31,20 +31,32 @@ jobs:
       - name: Verify dotnet tool pack
         run: dotnet pack src/ApiLookup/ApiLookup.csproj -c Release -o pack-check
 
-      - name: Verify single-file publish & prebuilt binary version (Windows)
+      - name: Verify single-file publish & prebuilt binary is in sync with source (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r win-x64 --no-self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-check
-          $builtVer = (./publish-check/apilookup.exe --version).Trim()
-          $repoVer = (./csharp-definition-lookup/scripts/apilookup.exe --version).Trim()
-          Write-Host "Built: $builtVer | Prebuilt: $repoVer"
-          if ($builtVer -ne $repoVer) {
-            throw "Prebuilt apilookup.exe ($repoVer) is out of sync with source ($builtVer). Run .\tools\build.ps1."
+          function Get-BuildInfo([string]$exe) {
+            $lines = & $exe --version --verbose
+            if ($LASTEXITCODE -ne 0) { throw "$exe --version --verbose failed" }
+            [pscustomobject]@{
+              Version    = ($lines | Select-Object -First 1).Trim()
+              SourceHash = (($lines | Where-Object { $_ -match '^source-hash:' }) -replace '^source-hash:\s*', '').Trim()
+            }
+          }
+          $built = Get-BuildInfo ./publish-check/apilookup.exe
+          $prebuilt = Get-BuildInfo ./csharp-definition-lookup/scripts/apilookup.exe
+          Write-Host "Built:    $($built.Version) | source-hash $($built.SourceHash)"
+          Write-Host "Prebuilt: $($prebuilt.Version) | source-hash $($prebuilt.SourceHash)"
+          if ([string]::IsNullOrEmpty($built.SourceHash) -or $built.SourceHash -eq 'unknown') {
+            throw "Fresh build did not embed a source hash."
+          }
+          if ($built.Version -ne $prebuilt.Version -or $built.SourceHash -ne $prebuilt.SourceHash) {
+            throw "Prebuilt apilookup.exe is out of sync with source. Run .\tools\build.ps1 and commit the result."
           }
 
       - name: Verify single-file publish (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r linux-x64 --no-self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-check
-          ./publish-check/apilookup --version
+          ./publish-check/apilookup --version --verbose

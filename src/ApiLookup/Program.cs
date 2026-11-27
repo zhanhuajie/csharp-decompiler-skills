@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace ApiLookup;
@@ -13,6 +14,69 @@ public static class Program
 
     private static readonly HashSet<string> ValidRoles = new(StringComparer.OrdinalIgnoreCase)
         { "both", "return", "param" };
+
+    /// <summary>Maps every accepted flag spelling to its canonical option name.</summary>
+    private static readonly Dictionary<string, string> OptionAliases = new(StringComparer.Ordinal)
+    {
+        ["-h"] = "help", ["--help"] = "help",
+        ["-v"] = "version", ["--version"] = "version",
+        ["-i"] = "index", ["--index"] = "index", ["-n"] = "index", ["--name"] = "index",
+        ["--db"] = "db",
+        ["-p"] = "project", ["--project"] = "project",
+        ["-d"] = "dir", ["--dir"] = "dir",
+        ["--dll"] = "dll",
+        ["--include"] = "include",
+        ["--exclude"] = "exclude",
+        ["--no-recursive"] = "no-recursive",
+        ["--include-nonpublic"] = "include-nonpublic",
+        ["--force"] = "force",
+        ["--tfm"] = "tfm",
+        ["--list"] = "list",
+        ["--drop"] = "drop",
+        ["--prune"] = "prune",
+        ["-k"] = "kind", ["--kind"] = "kind",
+        ["--namespace"] = "namespace", ["--ns"] = "namespace",
+        ["--assembly"] = "assembly", ["--asm"] = "assembly",
+        ["-m"] = "member", ["--member"] = "member",
+        ["--role"] = "role",
+        ["-l"] = "limit", ["--limit"] = "limit",
+        ["--inherited"] = "inherited",
+        ["--ext"] = "ext", ["--extensions"] = "ext",
+        ["--docs"] = "docs",
+        ["--list-refs"] = "list-refs",
+        ["--json"] = "json",
+        ["--verbose"] = "verbose",
+    };
+
+    private static readonly string[] GlobalOptions = { "help", "version", "json", "verbose" };
+
+    private static readonly string[] SourceOptions =
+        { "index", "db", "project", "dir", "dll", "include", "exclude", "no-recursive", "include-nonpublic", "force", "tfm" };
+
+    private static readonly string[] IndexManagementOptions = { "list", "drop", "prune" };
+
+    /// <summary>Options each command accepts; anything else is rejected instead of being silently ignored.</summary>
+    private static readonly Dictionary<string, HashSet<string>> CommandOptions = new(StringComparer.Ordinal)
+    {
+        ["index"] = OptionSet(SourceOptions, IndexManagementOptions),
+        ["search"] = OptionSet(SourceOptions, new[] { "namespace", "assembly", "kind", "limit", "list-refs" }),
+        ["show"] = OptionSet(SourceOptions, new[] { "namespace", "assembly", "member", "inherited", "ext", "docs" }),
+        ["hierarchy"] = OptionSet(SourceOptions, new[] { "namespace", "assembly", "limit" }),
+        ["by-type"] = OptionSet(SourceOptions, new[] { "namespace", "assembly", "role", "limit" }),
+        ["refs"] = OptionSet(SourceOptions),
+        ["locate"] = OptionSet(SourceOptions, new[] { "namespace", "assembly", "limit", "list-refs" }),
+    };
+
+    /// <summary>Commands that take exactly one &lt;TypeName&gt; positional argument.</summary>
+    private static readonly HashSet<string> SingleTypeArgCommands = new(StringComparer.Ordinal)
+        { "show", "hierarchy", "by-type", "locate", "scan" };
+
+    private static HashSet<string> OptionSet(params string[][] groups)
+    {
+        var set = new HashSet<string>(GlobalOptions, StringComparer.Ordinal);
+        foreach (var g in groups) set.UnionWith(g);
+        return set;
+    }
 
     public static int Main(string[] args)
     {
@@ -39,13 +103,7 @@ public static class Program
 
         if (opts.ShowVersion)
         {
-            var ver = typeof(Program).Assembly
-                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
-                ?? typeof(Program).Assembly.GetName().Version?.ToString()
-                ?? "0.3.0";
-            var plusIdx = ver.IndexOf('+');
-            if (plusIdx >= 0) ver = ver[..plusIdx];
-            outWriter.WriteLine($"apilookup {ver}");
+            WriteVersion(outWriter, opts.Verbose);
             return 0;
         }
 
@@ -62,9 +120,35 @@ public static class Program
         catch (Exception ex)
         {
             OutputFormatter.WriteError(ex.Message, 1, opts.Json, outWriter, errWriter);
+            if (opts.Verbose)
+                errWriter.WriteLine(ex.ToString());
             return 1;
         }
     }
+
+    private static void WriteVersion(TextWriter w, bool verbose)
+    {
+        var asm = typeof(Program).Assembly;
+        var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                   ?? asm.GetName().Version?.ToString()
+                   ?? "unknown";
+        var plusIdx = info.IndexOf('+');
+        w.WriteLine($"apilookup {(plusIdx >= 0 ? info[..plusIdx] : info)}");
+        if (!verbose) return;
+
+        w.WriteLine($"commit:      {(plusIdx >= 0 ? info[(plusIdx + 1)..] : "unknown")}");
+        w.WriteLine($"source-hash: {GetSourceHash() ?? "unknown"}");
+        w.WriteLine($"runtime:     {RuntimeInformation.FrameworkDescription} ({RuntimeInformation.RuntimeIdentifier})");
+    }
+
+    /// <summary>
+    /// Line-ending-normalized hash of the tool's source files, embedded at build time (see ApiLookup.csproj).
+    /// CI compares it between the committed prebuilt binary and a fresh build to detect stale binaries.
+    /// </summary>
+    internal static string? GetSourceHash()
+        => typeof(Program).Assembly
+            .GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(a => a.Key == "SourceHash")?.Value;
 
     private static int Execute(CliOptions opts, TextWriter outWriter, TextWriter errWriter)
     {
@@ -209,10 +293,7 @@ public static class Program
         if (matches.Count == 0)
         {
             var msg = $"Type '{typeQuery}' not found. Try 'apilookup search \"{typeQuery}\"' to find matching symbols.";
-            if (opts.Json)
-                OutputFormatter.WriteError(msg, 1, json: true, outWriter, errWriter);
-            else
-                errWriter.WriteLine(msg);
+            OutputFormatter.WriteError(msg, 1, opts.Json, outWriter, errWriter);
             return 1;
         }
 
@@ -430,138 +511,25 @@ public static class Program
         while (i < args.Length)
         {
             var arg = args[i];
-            switch (arg)
+            if (OptionAliases.TryGetValue(arg, out var option))
             {
-                case "-h":
-                case "--help":
-                    opts.ShowHelp = true;
-                    break;
-                case "-v":
-                case "--version":
-                    opts.ShowVersion = true;
-                    break;
-                case "-n":
-                case "--name":
-                case "-i":
-                case "--index":
-                    opts.IndexName = NextValue(arg);
-                    break;
-                case "--db":
-                    opts.DbPath = NextValue(arg);
-                    break;
-                case "-p":
-                case "--project":
-                    opts.Projects.Add(NextValue(arg));
-                    break;
-                case "-d":
-                case "--dir":
-                    opts.Dirs.Add(NextValue(arg));
-                    break;
-                case "--dll":
-                    opts.Dlls.Add(NextValue(arg));
-                    break;
-                case "--include":
-                    opts.IncludePatterns.Add(NextValue(arg));
-                    break;
-                case "--exclude":
-                    opts.ExcludePatterns.Add(NextValue(arg));
-                    break;
-                case "--no-recursive":
-                    opts.Recursive = false;
-                    break;
-                case "--include-nonpublic":
-                    opts.IncludeNonPublic = true;
-                    break;
-                case "--force":
-                    opts.ForceRebuild = true;
-                    break;
-                case "--tfm":
-                    opts.TargetFramework = NextValue(arg);
-                    break;
-                case "--list":
-                    opts.ListIndexes = true;
-                    break;
-                case "--drop":
-                    opts.DropIndex = NextValue(arg);
-                    break;
-                case "--prune":
-                    opts.PruneAuto = true;
-                    break;
-                case "-k":
-                case "--kind":
-                {
-                    var kind = NextValue(arg).Trim();
-                    if (!ValidKinds.Contains(kind))
-                        throw new ArgumentException($"Invalid --kind '{kind}'. Allowed values: {string.Join(", ", ValidKinds)}.");
-                    opts.KindFilter = kind;
-                    break;
-                }
-                case "--namespace":
-                case "--ns":
-                    opts.NamespaceFilter = NextValue(arg);
-                    break;
-                case "--assembly":
-                case "--asm":
-                    opts.AssemblyFilter = NextValue(arg);
-                    break;
-                case "-m":
-                case "--member":
-                    opts.MemberFilter = NextValue(arg);
-                    break;
-                case "--role":
-                {
-                    var role = NextValue(arg).Trim();
-                    if (!ValidRoles.Contains(role))
-                        throw new ArgumentException($"Invalid --role '{role}'. Allowed values: both, return, param.");
-                    opts.Role = role.ToLowerInvariant();
-                    break;
-                }
-                case "-l":
-                case "--limit":
-                    if (!int.TryParse(NextValue(arg), out var lim) || lim <= 0)
-                        throw new ArgumentException($"Option '{arg}' requires a positive integer.");
-                    opts.Limit = lim;
-                    break;
-                case "--inherited":
-                    opts.IncludeInherited = true;
-                    break;
-                case "--ext":
-                case "--extensions":
-                    opts.IncludeExtensions = true;
-                    break;
-                case "--docs":
-                    opts.ShowFullDocs = true;
-                    break;
-                case "--list-refs":
-                    opts.ListRefs = true;
-                    break;
-                case "--json":
-                    opts.Json = true;
-                    break;
-                case "--verbose":
-                    opts.Verbose = true;
-                    break;
-                default:
-                    if (arg.StartsWith('-'))
-                        throw new ArgumentException($"Unknown option: {arg}");
-                    if (string.IsNullOrEmpty(opts.Command))
-                    {
-                        if (KnownCommands.Contains(arg))
-                        {
-                            opts.Command = arg.ToLowerInvariant();
-                        }
-                        else
-                        {
-                            // Backward-compatible shorthand: `apilookup <SymbolName> --project ...` -> search
-                            opts.Command = "search";
-                            opts.Positional.Add(arg);
-                        }
-                    }
-                    else
-                    {
-                        opts.Positional.Add(arg);
-                    }
-                    break;
+                opts.SpecifiedOptions.TryAdd(option, arg);
+                ApplyOption(opts, option, arg, NextValue);
+            }
+            else if (arg.Length > 1 && arg.StartsWith('-'))
+            {
+                var hint = SuggestClosest(arg, OptionAliases.Keys.Where(k => k.StartsWith("--", StringComparison.Ordinal)));
+                throw new ArgumentException(hint != null
+                    ? $"Unknown option: {arg}. Did you mean '{hint}'?"
+                    : $"Unknown option: {arg}");
+            }
+            else if (string.IsNullOrEmpty(opts.Command))
+            {
+                opts.Command = ResolveCommandWord(arg, opts);
+            }
+            else
+            {
+                opts.Positional.Add(arg);
             }
             i++;
         }
@@ -569,7 +537,168 @@ public static class Program
         if (string.IsNullOrEmpty(opts.Command) && (opts.ListIndexes || opts.DropIndex != null || opts.PruneAuto))
             opts.Command = "index";
 
+        if (!opts.ShowHelp && !opts.ShowVersion && !string.IsNullOrEmpty(opts.Command))
+            ValidateCommandUsage(opts);
+
         return opts;
+    }
+
+    private static void ApplyOption(CliOptions opts, string option, string flag, Func<string, string> nextValue)
+    {
+        switch (option)
+        {
+            case "help": opts.ShowHelp = true; break;
+            case "version": opts.ShowVersion = true; break;
+            case "index": opts.IndexName = nextValue(flag); break;
+            case "db": opts.DbPath = nextValue(flag); break;
+            case "project": opts.Projects.Add(nextValue(flag)); break;
+            case "dir": opts.Dirs.Add(nextValue(flag)); break;
+            case "dll": opts.Dlls.Add(nextValue(flag)); break;
+            case "include": opts.IncludePatterns.Add(nextValue(flag)); break;
+            case "exclude": opts.ExcludePatterns.Add(nextValue(flag)); break;
+            case "no-recursive": opts.Recursive = false; break;
+            case "include-nonpublic": opts.IncludeNonPublic = true; break;
+            case "force": opts.ForceRebuild = true; break;
+            case "tfm": opts.TargetFramework = nextValue(flag); break;
+            case "list": opts.ListIndexes = true; break;
+            case "drop": opts.DropIndex = nextValue(flag); break;
+            case "prune": opts.PruneAuto = true; break;
+            case "kind":
+            {
+                var kind = nextValue(flag).Trim();
+                if (!ValidKinds.Contains(kind))
+                    throw new ArgumentException($"Invalid --kind '{kind}'. Allowed values: {string.Join(", ", ValidKinds)}.");
+                opts.KindFilter = kind;
+                break;
+            }
+            case "namespace": opts.NamespaceFilter = nextValue(flag); break;
+            case "assembly": opts.AssemblyFilter = nextValue(flag); break;
+            case "member": opts.MemberFilter = nextValue(flag); break;
+            case "role":
+            {
+                var role = nextValue(flag).Trim();
+                if (!ValidRoles.Contains(role))
+                    throw new ArgumentException($"Invalid --role '{role}'. Allowed values: both, return, param.");
+                opts.Role = role.ToLowerInvariant();
+                break;
+            }
+            case "limit":
+                if (!int.TryParse(nextValue(flag), out var lim) || lim <= 0)
+                    throw new ArgumentException($"Option '{flag}' requires a positive integer.");
+                opts.Limit = lim;
+                break;
+            case "inherited": opts.IncludeInherited = true; break;
+            case "ext": opts.IncludeExtensions = true; break;
+            case "docs": opts.ShowFullDocs = true; break;
+            case "list-refs": opts.ListRefs = true; break;
+            case "json": opts.Json = true; break;
+            case "verbose": opts.Verbose = true; break;
+            default: throw new InvalidOperationException($"Unhandled option '{option}'.");
+        }
+    }
+
+    /// <summary>
+    /// Maps the first positional word to a command. Unknown words fall back to the backward-compatible
+    /// `apilookup &lt;SymbolName&gt; ...` search shorthand, except when the word looks like a mistyped command
+    /// (e.g. "serach"), which would otherwise silently return "No results" with exit code 0.
+    /// </summary>
+    private static string ResolveCommandWord(string word, CliOptions opts)
+    {
+        if (KnownCommands.Contains(word))
+            return word.ToLowerInvariant();
+
+        if (LooksLikeCommandWord(word))
+        {
+            var suggestion = SuggestClosest(word, KnownCommands);
+            if (suggestion != null)
+            {
+                throw new ArgumentException(
+                    $"Unknown command '{word}'. Did you mean '{suggestion}'? " +
+                    $"(To search for the symbol '{word}', run: apilookup search {word} ...)");
+            }
+        }
+
+        opts.Positional.Add(word);
+        return "search";
+    }
+
+    private static bool LooksLikeCommandWord(string word)
+        => word.Length >= 3 && word.All(c => c is (>= 'a' and <= 'z') or '-');
+
+    /// <summary>Returns the closest candidate within a small edit distance (transpositions count as one edit).</summary>
+    internal static string? SuggestClosest(string input, IEnumerable<string> candidates)
+    {
+        var maxDistance = input.Length <= 4 ? 1 : 2;
+        string? best = null;
+        var bestDistance = int.MaxValue;
+        foreach (var candidate in candidates)
+        {
+            var d = EditDistance(input.ToLowerInvariant(), candidate.ToLowerInvariant());
+            if (d < bestDistance)
+            {
+                bestDistance = d;
+                best = candidate;
+            }
+        }
+        return bestDistance > 0 && bestDistance <= maxDistance ? best : null;
+    }
+
+    /// <summary>Optimal string alignment distance (Levenshtein + adjacent transpositions).</summary>
+    internal static int EditDistance(string a, string b)
+    {
+        var d = new int[a.Length + 1, b.Length + 1];
+        for (var i = 0; i <= a.Length; i++) d[i, 0] = i;
+        for (var j = 0; j <= b.Length; j++) d[0, j] = j;
+        for (var i = 1; i <= a.Length; i++)
+        {
+            for (var j = 1; j <= b.Length; j++)
+            {
+                var cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+                if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1])
+                    d[i, j] = Math.Min(d[i, j], d[i - 2, j - 2] + 1);
+            }
+        }
+        return d[a.Length, b.Length];
+    }
+
+    private static void ValidateCommandUsage(CliOptions opts)
+    {
+        var command = opts.Command == "scan" ? "locate" : opts.Command;
+        if (!CommandOptions.TryGetValue(command, out var allowed))
+            return;
+
+        foreach (var (option, typed) in opts.SpecifiedOptions)
+        {
+            if (!allowed.Contains(option))
+                throw new ArgumentException($"Option '{typed}' is not valid for '{opts.Command}'. Run 'apilookup --help' for usage.");
+        }
+
+        if (command is "index" or "refs" && opts.Positional.Count > 0)
+            throw new ArgumentException($"'{opts.Command}' does not take positional arguments (got: {string.Join(" ", opts.Positional)}).");
+
+        if (SingleTypeArgCommands.Contains(opts.Command) && opts.Positional.Count > 1)
+            throw new ArgumentException(
+                $"'{opts.Command}' takes a single <TypeName> argument (got: {string.Join(" ", opts.Positional)}). Quote names containing spaces.");
+
+        if (command == "index")
+        {
+            var management = IndexManagementOptions
+                .Where(opts.SpecifiedOptions.ContainsKey)
+                .Select(o => opts.SpecifiedOptions[o])
+                .ToList();
+            if (management.Count > 1)
+                throw new ArgumentException($"Options {string.Join(", ", management)} cannot be combined.");
+            if (management.Count == 1)
+            {
+                var sources = SourceOptions
+                    .Where(opts.SpecifiedOptions.ContainsKey)
+                    .Select(o => opts.SpecifiedOptions[o])
+                    .ToList();
+                if (sources.Count > 0)
+                    throw new ArgumentException($"'{management[0]}' cannot be combined with {string.Join(", ", sources)}.");
+            }
+        }
     }
 
     private static void PrintHelp(TextWriter w)
@@ -597,7 +726,7 @@ Source & Index Options (usable on any command; auto-cached by file fingerprint):
   --no-recursive               Do not recurse subdirectories for --dir
   --include-nonpublic          Also index internal/private types and members
   --force                      Force rebuild even if cached fingerprint matches
-  --prune                      Delete auto-cached (auto-*.db) indexes when running 'index'
+  --prune                      Delete auto-cached (auto-*.db) indexes and stale temp build files when running 'index'
 
 Query Options:
   -k, --kind <kind>            Filter search: type|member|class|struct|interface|enum|delegate|method|property|ctor|field|event
@@ -608,18 +737,20 @@ Query Options:
   --ext                        Include extension methods targeting this type in 'show'
   --docs                       Include full @param / @returns / Remarks XML docs in 'show'
   --role <return|param|both>   Filter direction in 'by-type' (default: both)
-  -l, --limit <n>              Max results (default: 30 for search, 40 for by-type, 100 for hierarchy)
-  --list-refs                  Print indexed assemblies before search results
+  -l, --limit <n>              Max results in search/by-type/hierarchy/locate (defaults: 30 / 40 / 100 / 100)
+  --list-refs                  Print indexed/resolved assemblies before search or locate results
   --json                       Emit structured camelCase JSON (including error objects)
-  --verbose                    Print detailed metadata/XML warnings to stderr
-  -v, --version                Print version and exit
+  --verbose                    Print detailed warnings and error stack traces to stderr
+  -v, --version                Print version and exit (add --verbose for commit, source hash, runtime)
+
+Options are validated per command: passing an option a command does not use is an error.
 
 Environment:
   APILOOKUP_CACHE_DIR          Override default SQLite index cache directory
 
 Exit Codes:
   0  Success (or help/version printed)
-  1  Error (invalid arguments, missing source/index, or type not found)
+  1  Error (invalid arguments, unknown command/option, missing source/index, or type not found)
   2  Ambiguous type match in 'show' or 'hierarchy' (candidates written to stdout)
 
 Examples:

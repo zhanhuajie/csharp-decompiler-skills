@@ -40,7 +40,9 @@ public static class IndexBuilder
             return (lockedFastStore, stats);
         }
 
-        var tempPath = dbPath + $".tmp-{Environment.ProcessId}-{Guid.NewGuid():N}";
+        var tempPath = IndexCatalog.CreateTempBuildPath(dbPath);
+        using var producerCts = new CancellationTokenSource();
+        Task? producerTask = null;
         try
         {
             if (File.Exists(tempPath)) File.Delete(tempPath);
@@ -53,11 +55,12 @@ public static class IndexBuilder
             });
 
             var extractWarnings = new ConcurrentBag<string>();
-            var producerTask = Task.Run(async () =>
+            var parallelOptions = new ParallelOptions { CancellationToken = producerCts.Token };
+            producerTask = Task.Run(async () =>
             {
                 try
                 {
-                    await Parallel.ForEachAsync(sources.Assemblies, async (asm, ct) =>
+                    await Parallel.ForEachAsync(sources.Assemblies, parallelOptions, async (asm, ct) =>
                     {
                         var localWarnings = new List<string>();
                         var extracted = MetadataExtractor.Extract(asm, includeNonPublic, localWarnings);
@@ -102,7 +105,14 @@ ANALYZE;
             foreach (var w in extractWarnings)
                 warnings?.Add(w);
 
-            File.Move(tempPath, dbPath, overwrite: true);
+            ReplaceFileWithRetry(tempPath, dbPath);
+        }
+        catch
+        {
+            // Unblock producers waiting on the bounded channel so they don't leak when the writer fails.
+            producerCts.Cancel();
+            try { producerTask?.Wait(TimeSpan.FromSeconds(5)); } catch { }
+            throw;
         }
         finally
         {
@@ -117,26 +127,58 @@ ANALYZE;
         return (store, builtStats);
     }
 
+    /// <summary>
+    /// Atomically replaces <paramref name="destPath"/>, retrying briefly when another process
+    /// (e.g. a concurrent read-only query on Windows) still holds the old database open.
+    /// </summary>
+    private static void ReplaceFileWithRetry(string sourcePath, string destPath)
+    {
+        const int maxAttempts = 20;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                File.Move(sourcePath, destPath, overwrite: true);
+                return;
+            }
+            catch (Exception ex) when (attempt < maxAttempts && ex is IOException or UnauthorizedAccessException)
+            {
+                Thread.Sleep(100);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new IOException(
+                    $"Could not replace index database '{destPath}' because it is locked by another process. " +
+                    "Close other apilookup queries using this index and retry.", ex);
+            }
+        }
+    }
+
     private static bool TryOpenMatching(string dbPath, string expectedFingerprint, out IndexStore? store)
     {
         store = null;
         if (!File.Exists(dbPath)) return false;
 
+        IndexStore? candidate = null;
         try
         {
-            var candidate = IndexStore.OpenReadOnly(dbPath);
+            candidate = IndexStore.OpenReadOnly(dbPath);
             if (candidate.GetMeta("fingerprint") == expectedFingerprint &&
                 candidate.GetMeta("schema_version") == SchemaVersion)
             {
                 store = candidate;
+                candidate = null; // ownership transferred to caller
                 return true;
             }
-            candidate.Dispose();
         }
         catch
         {
-            store?.Dispose();
-            store = null;
+            // Corrupt, foreign, or legacy (pre-meta) database: treat as stale and rebuild.
+        }
+        finally
+        {
+            // Always release the handle so the rebuilt temp DB can atomically replace dbPath (Windows sharing rules).
+            candidate?.Dispose();
         }
         return false;
     }

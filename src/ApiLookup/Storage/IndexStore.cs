@@ -46,13 +46,21 @@ JOIN assemblies a ON a.id = m.assembly_id";
         if (!File.Exists(dbPath))
             throw new FileNotFoundException($"Index database not found: {dbPath}", dbPath);
         var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly;Pooling=False");
-        conn.Open();
-        using (var pragma = conn.CreateCommand())
+        try
         {
-            pragma.CommandText = "PRAGMA temp_store = MEMORY;";
-            pragma.ExecuteNonQuery();
+            conn.Open();
+            using (var pragma = conn.CreateCommand())
+            {
+                pragma.CommandText = "PRAGMA temp_store = MEMORY;";
+                pragma.ExecuteNonQuery();
+            }
+            return new IndexStore(dbPath, conn);
         }
-        return new IndexStore(dbPath, conn);
+        catch
+        {
+            conn.Dispose();
+            throw;
+        }
     }
 
     public IReadOnlyList<SearchHit> Search(

@@ -33,6 +33,8 @@
 dotnet test .\ApiLookup.sln -c Release
 ```
 
+> 构建时会嵌入源码的哈希（已统一换行符；`apilookup --version --verbose` 输出中的 `source-hash:`）。如果仓库里的 `scripts/apilookup.exe` 与重新构建的哈希不一致，CI 会失败，所以每次修改源码后都要重新运行 `.\tools\build.ps1` 并提交二进制。
+
 跨平台运行或全局工具安装：
 - 直接运行：`dotnet run --project src/ApiLookup -- <参数>`
 - 发布单文件：`.\tools\build.ps1 -Runtime linux-x64`（或 `osx-arm64`）

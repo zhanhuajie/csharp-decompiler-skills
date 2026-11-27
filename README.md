@@ -33,6 +33,8 @@ A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/
 dotnet test .\ApiLookup.sln -c Release
 ```
 
+> The build embeds a line-ending-normalized hash of the sources (`apilookup --version --verbose` → `source-hash:`). CI fails if the committed `scripts/apilookup.exe` hash differs from a fresh build, so re-run `.\tools\build.ps1` and commit the binary after every source change.
+
 Cross-platform & global tool options:
 - Run from source: `dotnet run --project src/ApiLookup -- <args>`
 - Publish single-file: `.\tools\build.ps1 -Runtime linux-x64` (or `osx-arm64`)

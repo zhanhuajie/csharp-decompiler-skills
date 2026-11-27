@@ -55,7 +55,10 @@ public static class OutputFormatter
         var w = output ?? Console.Out;
         var action = stats.Rebuilt ? "Built" : "Up-to-date";
         var sizeMb = stats.DbSizeBytes / (1024.0 * 1024.0);
-        w.WriteLine($"[{action}] {(stats.IndexName != null ? $"index '{stats.IndexName}'" : "auto-cache")}");
+        var label = stats.IndexName != null
+            ? $"index '{stats.IndexName}'"
+            : IndexCatalog.IsAutoCachePath(stats.DbPath) ? "auto-cache" : "database";
+        w.WriteLine($"[{action}] {label}");
         w.WriteLine($"  DB:         {stats.DbPath} ({sizeMb:F2} MB)");
         w.WriteLine($"  Assemblies: {stats.AssemblyCount} (with XML docs: {stats.XmlDocCount})");
         w.WriteLine($"  Types:      {stats.TypeCount:N0}");
@@ -101,7 +104,10 @@ public static class OutputFormatter
         if (json) { WriteJson(result, ApiLookupJsonContext.Default.PruneResult, output); return; }
         var w = output ?? Console.Out;
         var freedMb = result.FreedBytes / (1024.0 * 1024.0);
-        w.WriteLine($"Pruned {result.RemovedCount} auto-cache index(es), freed {freedMb:F2} MB.");
+        var tempPart = result.RemovedTempCount > 0
+            ? $" and {result.RemovedTempCount} stale temp build file(s)"
+            : string.Empty;
+        w.WriteLine($"Pruned {result.RemovedCount} auto-cache index(es){tempPart}, freed {freedMb:F2} MB.");
     }
 
     public static void WriteSearchHits(string query, IReadOnlyList<SearchHit> hits, bool json, TextWriter? output = null)

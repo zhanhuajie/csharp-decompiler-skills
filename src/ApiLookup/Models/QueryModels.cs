@@ -115,7 +115,8 @@ public sealed record DropIndexResult(
 public sealed record PruneResult(
     int RemovedCount,
     long FreedBytes,
-    IReadOnlyList<string> RemovedFiles);
+    IReadOnlyList<string> RemovedFiles,
+    int RemovedTempCount = 0);
 
 public sealed record LocateHit(
     string FullName,

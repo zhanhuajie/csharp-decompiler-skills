@@ -5,6 +5,7 @@ using Xunit;
 
 namespace ApiLookup.Tests;
 
+[Collection(EnvironmentSensitiveCollection.Name)]
 public class CliTests : IDisposable
 {
     private readonly string _tempDir;
