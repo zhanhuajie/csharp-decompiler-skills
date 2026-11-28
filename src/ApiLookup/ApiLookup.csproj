@@ -21,7 +21,7 @@
   <!--
     Embed a line-ending-normalized SHA-256 of the tool's sources as [AssemblyMetadata("SourceHash", ...)].
     Running apilookup with the version and verbose flags prints it, and CI compares the committed prebuilt binary against a fresh
-    build so a stale csharp-definition-lookup/scripts/apilookup.exe is caught even without a version bump.
+    build so a stale dotnet-api-lookup/scripts/apilookup.exe is caught even without a version bump.
   -->
   <UsingTask TaskName="ComputeApiLookupSourceHash"
              TaskFactory="RoslynCodeTaskFactory"

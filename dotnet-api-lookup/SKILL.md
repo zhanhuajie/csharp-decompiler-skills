@@ -1,9 +1,9 @@
 ---
-name: csharp-definition-lookup
-description: Fast offline .NET API metadata & XML-doc lookup powered by System.Reflection.Metadata + SQLite FTS5. Use to search types/members/XML docs across .csproj references, NuGet packages, or SDK directories (Revit, AutoCAD, Plant 3D, etc.), inspect clean C# API skeletons (with inherited members and extension methods), explore type hierarchies, and reverse-lookup methods returning/accepting a type. Use csharp-decompiler only when you need method bodies or internal implementation details.
+name: dotnet-api-lookup
+description: Fast offline .NET API metadata & XML-doc lookup powered by System.Reflection.Metadata + SQLite FTS5. Use to search types/members/XML docs across .csproj references, NuGet packages, or SDK directories (Revit, AutoCAD, Plant 3D, etc.), inspect clean C# API skeletons (with inherited members and extension methods), explore type hierarchies, and reverse-lookup methods returning/accepting a type. Use dotnet-decompiler only when you need method bodies or internal implementation details.
 ---
 
-# C# Definition & API Lookup
+# .NET API Lookup
 
 Offline .NET metadata & XML documentation indexer (`System.Reflection.Metadata` + SQLite FTS5). Extracts clean C# signatures (including full nullable annotations at every position such as `Dictionary<string, object?>?` and `string?[]`, `ref`/`readonly` structs, `ref` returns, `[Flags]` & `decimal` constants), class/interface inheritance chains (resolved by exact generic arity, so `Foo` and `Foo<T>` never mix), extension methods (including constrained generic extensions), enum values, type forwarders, and companion `.xml` docs (with `<inheritdoc/>` resolved across indexed assemblies) directly from PE assemblies—without loading them into a host process or decompiling noisy IL.
 
@@ -98,14 +98,14 @@ apilookup.exe by-type DataLinksManager3d --index acad2025
 apilookup.exe by-type Autodesk.Revit.DB.Wall --index revit2026 --role return --limit 20
 ```
 
-## When to Escalate to `csharp-decompiler`
+## When to Escalate to `dotnet-decompiler`
 
-Use `csharp-definition-lookup` **first** for:
+Use `dotnet-api-lookup` **first** for:
 - Finding which DLL and namespace a type lives in (including `[TypeForwardedTo]` facade redirects)
 - Checking method signatures, overloads, optional parameters, enums, XML docs
 - Discovering inherited members, extension methods, subclasses, and factory methods
 
-Escalate to `csharp-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when you need method implementation details** (e.g., hidden side effects, native interop preconditions, or internal error-dialog class names). `show` prints the exact `Assembly` path and `CLR Name` needed by `ilspycmd`.
+Escalate to `dotnet-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when you need method implementation details** (e.g., hidden side effects, native interop preconditions, or internal error-dialog class names). `show` prints the exact `Assembly` path and `CLR Name` needed by `ilspycmd`.
 
 ## Tips & Notes
 

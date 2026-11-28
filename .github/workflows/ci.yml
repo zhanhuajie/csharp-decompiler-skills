@@ -23,10 +23,10 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Restore dependencies
-        run: dotnet restore ApiLookup.sln
+        run: dotnet restore src/ApiLookup.sln
 
       - name: Build and test
-        run: dotnet test ApiLookup.sln -c Release --no-restore --verbosity normal
+        run: dotnet test src/ApiLookup.sln -c Release --no-restore --verbosity normal
 
       - name: Verify dotnet tool pack
         run: dotnet pack src/ApiLookup/ApiLookup.csproj -c Release -o pack-check
@@ -45,7 +45,7 @@ jobs:
             }
           }
           $built = Get-BuildInfo ./publish-check/apilookup.exe
-          $prebuilt = Get-BuildInfo ./csharp-definition-lookup/scripts/apilookup.exe
+          $prebuilt = Get-BuildInfo ./dotnet-api-lookup/scripts/apilookup.exe
           Write-Host "Built:    $($built.Version) | source-hash $($built.SourceHash)"
           Write-Host "Prebuilt: $($prebuilt.Version) | source-hash $($prebuilt.SourceHash)"
           if ([string]::IsNullOrEmpty($built.SourceHash) -or $built.SourceHash -eq 'unknown') {

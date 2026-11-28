@@ -8,8 +8,8 @@ A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/
 
 | Skill | Description |
 | --- | --- |
-| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | Offline .NET API indexer (`System.Reflection.Metadata` + SQLite FTS5). Full-text, CamelCase & CJK search across types, members, and XML docs; clean C# API skeletons (full nullable annotations, `ref`/`readonly` structs, inherited class/interface members & constrained generic extensions, `<inheritdoc/>` resolution); arity-exact type hierarchy, reverse type lookup, and `[TypeForwardedTo]` locator. |
-| [csharp-decompiler](csharp-decompiler/SKILL.md) | Decompile .NET IL assemblies (`.dll`, `.exe`) to C# source code via `ilspycmd`. Use when method bodies, internal side effects, or full project export are needed. |
+| [dotnet-api-lookup](dotnet-api-lookup/SKILL.md) | Offline .NET API indexer (`System.Reflection.Metadata` + SQLite FTS5). Full-text, CamelCase & CJK search across types, members, and XML docs; clean C# API skeletons (full nullable annotations, `ref`/`readonly` structs, inherited class/interface members & constrained generic extensions, `<inheritdoc/>` resolution); arity-exact type hierarchy, reverse type lookup, and `[TypeForwardedTo]` locator. |
+| [dotnet-decompiler](dotnet-decompiler/SKILL.md) | Decompile .NET IL assemblies (`.dll`, `.exe`) to C# source code via `ilspycmd`. Use when method bodies, internal side effects, or full project export are needed. |
 
 ---
 
@@ -19,22 +19,23 @@ A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/
 
 - Standalone **Native AOT** archives for `win-x64`, `linux-x64`, and `osx-arm64` are built on [GitHub Releases](../../releases) (**no .NET runtime required**, faster startup/queries).
 - Or use the prebuilt Windows single-file binary / `.NET Tool` / `dotnet run` with [.NET 8+ SDK / Runtime](https://dotnet.microsoft.com/download) installed.
-- **ilspycmd** installed (for `csharp-decompiler`):
+- **ilspycmd** installed (for `dotnet-decompiler`; `.NET 10+ SDK` automatically installs the standalone Native AOT single-file binary on `win-x64` / `linux-x64`):
   ```bash
   dotnet tool install -g ilspycmd
   ```
+  (No .NET 10 SDK? See [dotnet-decompiler/SKILL.md](dotnet-decompiler/SKILL.md) to download the standalone `ilspycmd.win-x64` / `ilspycmd.linux-x64` NuGet binary directly.)
 
 ### Build / Publish `apilookup` (Optional — Windows binary is prebuilt)
 
 ```powershell
-# Build and publish framework-dependent single-file binary into csharp-definition-lookup/scripts/
+# Build and publish framework-dependent single-file binary into dotnet-api-lookup/scripts/
 .\tools\build.ps1
 
 # Build standalone Native AOT binary (outputs to artifacts/apilookup-<rid>-aot/, zero .NET runtime required)
 .\tools\build.ps1 -Aot -Runtime win-x64
 
 # Run unit tests
-dotnet test .\ApiLookup.sln -c Release
+dotnet test .\src\ApiLookup.sln -c Release
 ```
 
 > The build embeds a line-ending-normalized hash of the sources (`apilookup --version --verbose` → `source-hash:`). CI fails if the committed `scripts/apilookup.exe` hash differs from a fresh build, so re-run `.\tools\build.ps1` and commit the binary after every source change.
@@ -47,7 +48,7 @@ Cross-platform & global tool options:
 
 ---
 
-## csharp-definition-lookup (`apilookup`)
+## dotnet-api-lookup (`apilookup`)
 
 Powered by `System.Reflection.Metadata` + SQLite FTS5. Indexes managed assemblies (and companion `.xml` documentation files) into a fast local cache without loading DLLs or decompiling noisy IL.
 
@@ -55,13 +56,13 @@ Powered by `System.Reflection.Metadata` + SQLite FTS5. Indexes managed assemblie
 
 ```powershell
 # AutoCAD + Plant 3D (filter to Autodesk / PnP DLLs)
-.\csharp-definition-lookup\scripts\apilookup.exe index --name acad2025 --no-recursive `
+.\dotnet-api-lookup\scripts\apilookup.exe index --name acad2025 --no-recursive `
   --dir "C:\Program Files\Autodesk\AutoCAD 2025" `
   --dir "C:\Program Files\Autodesk\AutoCAD 2025\PLNT3D" `
   --include "ac*mgd.dll" --include "Ac*.dll" --include "Autodesk.*.dll" --include "PnP*.dll" --include "PnId*.dll"
 
 # Revit (automatically indexes RevitAPI.xml & RevitAPIUI.xml)
-.\csharp-definition-lookup\scripts\apilookup.exe index --name revit2026 `
+.\dotnet-api-lookup\scripts\apilookup.exe index --name revit2026 `
   --dll "C:\Program Files\Autodesk\Revit 2026\RevitAPI.dll" `
   --dll "C:\Program Files\Autodesk\Revit 2026\RevitAPIUI.dll"
 ```
@@ -91,16 +92,19 @@ apilookup.exe search Asset --project C:\repo\MyApp\MyApp.csproj --list-refs
 
 ---
 
-## csharp-decompiler (`ilspycmd`)
+## dotnet-decompiler (`ilspycmd`)
 
 Use when signatures and XML docs aren't enough and you need the actual method implementation:
 
 ```powershell
-# Windows (PowerShell — ilspycmd writes C# to stdout and version notices to stderr; pipe stdout as UTF-8)
-ilspycmd -t <FullNamespace.ClassName> <assembly_path> | Out-File -FilePath "$env:TEMP\MyType.cs" -Encoding utf8
+# Decompile a single member cleanly (ideal for large classes after finding the member via apilookup)
+ilspycmd --disable-updatecheck -m 'M:Namespace.ClassName.MethodName' <assembly_path>
 
-# Full project export
-ilspycmd -p -o <output_directory> <assembly_path>
+# Decompile a specific type to a clean UTF-8 file (use single quotes in PowerShell for generic `1 names)
+ilspycmd --disable-updatecheck -t 'FullNamespace.ClassName' -o "$env:TEMP\decompiled" <assembly_path>
+
+# Full project export with nested namespace directories
+ilspycmd --disable-updatecheck -p --nested-directories -o <output_directory> <assembly_path>
 ```
 
 ---
@@ -111,10 +115,10 @@ ilspycmd -p -o <output_directory> <assembly_path>
 Need API / type / usage
         │
         ▼
-csharp-definition-lookup (apilookup)  ──►  FTS5 search, C# skeleton, XML docs,
+dotnet-api-lookup (apilookup)         ──►  FTS5 search, C# skeleton, XML docs,
         │                                  inheritance, extensions, exact DLL path
         ▼ (only when method body / internal side effects matter)
-csharp-decompiler (ilspycmd)          ──►  Full C# decompiled implementation
+dotnet-decompiler (ilspycmd)          ──►  Full C# decompiled implementation
 ```
 
 ---
@@ -122,11 +126,11 @@ csharp-decompiler (ilspycmd)          ──►  Full C# decompiled implementati
 ## Repository Structure
 
 ```text
-ApiLookup.sln
-Directory.Build.props
 .github/workflows/ci.yml
 .github/workflows/release.yml
 src/
+  ApiLookup.sln
+  Directory.Build.props
   ApiLookup/               # .NET 8 / Native AOT CLI (System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5)
     Cli/                   # Command catalog (options/arity per command), parser, handlers, help & build info
     Extraction/            # Metadata, constants/nullability, TypeSig single-pass decoder, tokenizer & stat-cached source resolver
@@ -136,11 +140,11 @@ src/
   ApiLookup.Tests/         # xUnit unit & integration tests
 tools/
   build.ps1                # Publishes framework-dependent single-file or Native AOT apilookup binary
-csharp-definition-lookup/
+dotnet-api-lookup/
   SKILL.md                 # Skill guide for AI agents
   scripts/
     apilookup.exe          # Prebuilt Windows single-file CLI (framework-dependent)
-csharp-decompiler/
+dotnet-decompiler/
   SKILL.md                 # Skill guide for AI agents
 ```
 

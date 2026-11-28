@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build and publish the apilookup CLI binary (framework-dependent single-file by default, or standalone Native AOT with -Aot).
+  Build and publish the apilookup CLI binary (framework-dependent single-file to dotnet-api-lookup/scripts/ by default, or standalone Native AOT with -Aot).
 
 .EXAMPLE
   .\tools\build.ps1
@@ -67,7 +67,7 @@ if ($Aot) {
     return
 }
 
-$outDir = if ([string]::IsNullOrWhiteSpace($OutputDir)) { Join-Path $repoRoot "csharp-definition-lookup\scripts" } else { $OutputDir }
+$outDir = if ([string]::IsNullOrWhiteSpace($OutputDir)) { Join-Path $repoRoot "dotnet-api-lookup\scripts" } else { $OutputDir }
 $tempOut = Join-Path $repoRoot "src\ApiLookup\bin\$Configuration\publish-$Runtime"
 
 Write-Host "== Publishing apilookup ($Runtime, framework-dependent single-file) ==" -ForegroundColor Cyan
