@@ -17,7 +17,8 @@
 
 ### 前置条件
 
-- 已安装 [.NET 8+ SDK / Runtime](https://dotnet.microsoft.com/download)
+- 可直接从 [GitHub Releases](../../releases) 下载 `win-x64` / `linux-x64` / `osx-arm64` 独立 **Native AOT** 压缩包（**无需安装 .NET 运行时**，启动与查询更快）
+- 或使用仓库预编译的 Windows 单文件版 / `.NET Tool` / `dotnet run`（需安装 [.NET 8+ SDK / Runtime](https://dotnet.microsoft.com/download)）
 - 已安装 **ilspycmd**（`csharp-decompiler` 所需）：
   ```bash
   dotnet tool install -g ilspycmd
@@ -29,6 +30,9 @@
 # 编译并发布框架依赖单文件二进制到 csharp-definition-lookup/scripts/
 .\tools\build.ps1
 
+# 编译独立 Native AOT 二进制（输出到 artifacts/apilookup-<rid>-aot/，无需 .NET 运行时）
+.\tools\build.ps1 -Aot -Runtime win-x64
+
 # 运行单元测试
 dotnet test .\ApiLookup.sln -c Release
 ```
@@ -38,6 +42,7 @@ dotnet test .\ApiLookup.sln -c Release
 跨平台运行或全局工具安装：
 - 直接运行：`dotnet run --project src/ApiLookup -- <参数>`
 - 发布单文件：`.\tools\build.ps1 -Runtime linux-x64`（或 `osx-arm64`）
+- 发布独立 Native AOT：`.\tools\build.ps1 -Aot -Runtime linux-x64`（或 `osx-arm64`、`win-x64`）
 - 打包为 `.NET Tool`：`dotnet pack src/ApiLookup -c Release -o artifacts && dotnet tool install -g --add-source artifacts ApiLookup`
 
 ---
@@ -120,16 +125,17 @@ csharp-decompiler (ilspycmd)          ──►  反编译完整 C# 实现源码
 ApiLookup.sln
 Directory.Build.props
 .github/workflows/ci.yml
+.github/workflows/release.yml
 src/
-  ApiLookup/               # .NET 8 CLI（System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5）
+  ApiLookup/               # .NET 8 / Native AOT CLI（System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5）
     Cli/                   # 命令目录（各命令允许的选项与参数个数）、解析器、命令处理、帮助与版本信息
-    Extraction/            # PE 元数据、常量/可空特性、类型名/签名解码、中英文分词与工程源解析
+    Extraction/            # PE 元数据、常量/可空特性、TypeSig 单遍解码、中英文分词与 stat 缓存工程源解析
     Formatting/            # 文本/JSON 输出格式化与统一 camelCase 源生成序列化上下文
     Models/                # 元数据与查询结果数据模型、常用类型名与种类常量
-    Storage/               # 表结构定义、行读取器、缓存目录管理、流式异步建库与 SQLite 查询
+    Storage/               # 表结构定义、行读取器、缓存目录管理、流式异步建库、inheritdoc 解析与 SQLite 查询
   ApiLookup.Tests/         # xUnit 单元测试与集成测试
 tools/
-  build.ps1                # 发布 apilookup 到 csharp-definition-lookup/scripts/
+  build.ps1                # 发布单文件或独立 Native AOT 版 apilookup
 csharp-definition-lookup/
   SKILL.md                 # 技能描述与用法（供 AI Agent 加载）
   scripts/

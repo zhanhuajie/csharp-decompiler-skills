@@ -58,15 +58,15 @@ public class AccuracyTests : IDisposable
         // Dictionary<string, List<object>>: [dict, string, List, object]
         var obj = new PrimitiveTypeSig(System.Reflection.Metadata.PrimitiveTypeCode.Object);
         var str = new PrimitiveTypeSig(System.Reflection.Metadata.PrimitiveTypeCode.String);
-        var list = new GenericInstanceTypeSig(new NamedTypeSig("List", "System.Collections.Generic.List", false), [obj]);
-        var dict = new GenericInstanceTypeSig(new NamedTypeSig("Dictionary", "System.Collections.Generic.Dictionary", false), [str, list]);
+        var list = new GenericInstanceTypeSig(new NamedTypeSig("List", "System.Collections.Generic.List", false, "System.Collections.Generic.List`1"), [obj]);
+        var dict = new GenericInstanceTypeSig(new NamedTypeSig("Dictionary", "System.Collections.Generic.Dictionary", false, "System.Collections.Generic.Dictionary`2"), [str, list]);
 
         Assert.Equal("Dictionary<string, List<object>>", TypeSigRenderer.Render(dict));
         Assert.Equal("Dictionary<string?, List<object?>>?", TypeSigRenderer.Render(dict, NullableFlags.PerPosition(new byte[] { 2, 2, 1, 2 })));
         Assert.Equal("Dictionary<string?, List<object?>?>?", TypeSigRenderer.Render(dict, NullableFlags.Uniform(2)));
 
         // Generic value types consume a placeholder byte: KeyValuePair<string, object> -> [0, string, object]
-        var kvp = new GenericInstanceTypeSig(new NamedTypeSig("KeyValuePair", "System.Collections.Generic.KeyValuePair", true), [str, obj]);
+        var kvp = new GenericInstanceTypeSig(new NamedTypeSig("KeyValuePair", "System.Collections.Generic.KeyValuePair", true, "System.Collections.Generic.KeyValuePair`2"), [str, obj]);
         Assert.Equal("KeyValuePair<string, object?>", TypeSigRenderer.Render(kvp, NullableFlags.PerPosition(new byte[] { 0, 1, 2 })));
 
         // Non-generic value types consume nothing; arrays consume their own byte before the element's.

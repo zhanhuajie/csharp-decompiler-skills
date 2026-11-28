@@ -240,9 +240,23 @@ internal static class CommandHandlers
     private static (IndexStore Store, IndexStats Stats) OpenOrBuildIndex(CommandContext ctx)
     {
         var opts = ctx.Options;
-        var resolved = ResolveSources(ctx);
+        Action<string>? timing = opts.Verbose ? msg => ctx.Err.WriteLine($"[timing] {msg}") : null;
 
-        var dbPath = IndexCatalog.ResolveDbPath(opts.IndexName, opts.DbPath, resolved.SourceKey);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var discovered = DiscoverSources(ctx);
+        timing?.Invoke($"discover {discovered.Candidates.Count} candidate binaries {sw.ElapsedMilliseconds} ms");
+
+        var dbPath = IndexCatalog.ResolveDbPath(opts.IndexName, opts.DbPath, discovered.SourceKey);
+        if (!opts.ForceRebuild && IndexBuilder.TryOpenFresh(dbPath, opts.IndexName, discovered, opts.IncludeNonPublic, out var fresh))
+        {
+            timing?.Invoke("stat fingerprint matched; reused index without opening assemblies");
+            return fresh;
+        }
+
+        sw.Restart();
+        var resolved = ProbeSources(ctx, discovered);
+        timing?.Invoke($"probe {resolved.Assemblies.Count} managed assemblies {sw.ElapsedMilliseconds} ms");
+
         var descParts = new List<string>();
         descParts.AddRange(opts.Dirs.Select(d => "dir:" + Path.GetFullPath(d)));
         descParts.AddRange(opts.Projects.Select(p => "project:" + Path.GetFullPath(p)));
@@ -256,7 +270,8 @@ internal static class CommandHandlers
             string.Join("; ", descParts),
             opts.IncludeNonPublic,
             opts.ForceRebuild,
-            extractWarnings);
+            extractWarnings,
+            timing);
 
         if (opts.Verbose)
         {
@@ -271,11 +286,14 @@ internal static class CommandHandlers
         return result;
     }
 
-    /// <summary>Resolves --dir/--project/--dll into assemblies, printing resolver warnings to stderr.</summary>
-    private static ResolvedSources ResolveSources(CommandContext ctx)
+    /// <summary>Resolves --dir/--project/--dll into managed assemblies, printing resolver warnings to stderr.</summary>
+    private static ResolvedSources ResolveSources(CommandContext ctx) => ProbeSources(ctx, DiscoverSources(ctx));
+
+    /// <summary>Cheap discovery (directory listings + file metadata only); prints discovery warnings.</summary>
+    private static DiscoveredSources DiscoverSources(CommandContext ctx)
     {
         var opts = ctx.Options;
-        var resolved = SourceResolver.Resolve(
+        var discovered = SourceResolver.Discover(
             opts.Projects,
             opts.Dirs,
             opts.Dlls,
@@ -284,17 +302,27 @@ internal static class CommandHandlers
             opts.ExcludePatterns,
             opts.IncludeNonPublic,
             opts.TargetFramework);
+        WriteWarnings(ctx, discovered.Warnings);
+        return discovered;
+    }
 
-        if (!opts.Json || opts.Verbose)
-        {
-            foreach (var w in resolved.Warnings)
-                ctx.Err.WriteLine($"Warning: {w}");
-        }
+    /// <summary>Opens candidate PE headers; prints only warnings not already reported by discovery.</summary>
+    private static ResolvedSources ProbeSources(CommandContext ctx, DiscoveredSources discovered)
+    {
+        var resolved = SourceResolver.Probe(discovered);
+        WriteWarnings(ctx, resolved.Warnings.Skip(discovered.Warnings.Count));
 
         if (resolved.Assemblies.Count == 0)
             throw new InvalidOperationException("No managed .NET assemblies found in the specified sources.");
 
         return resolved;
+    }
+
+    private static void WriteWarnings(CommandContext ctx, IEnumerable<string> warnings)
+    {
+        if (ctx.Options.Json && !ctx.Options.Verbose) return;
+        foreach (var w in warnings)
+            ctx.Err.WriteLine($"Warning: {w}");
     }
 
     private static IndexStore OpenNamedIndex(CliOptions opts)

@@ -17,7 +17,8 @@ A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/
 
 ### Prerequisites
 
-- [.NET 8+ SDK / Runtime](https://dotnet.microsoft.com/download) installed
+- Standalone **Native AOT** archives for `win-x64`, `linux-x64`, and `osx-arm64` are built on [GitHub Releases](../../releases) (**no .NET runtime required**, faster startup/queries).
+- Or use the prebuilt Windows single-file binary / `.NET Tool` / `dotnet run` with [.NET 8+ SDK / Runtime](https://dotnet.microsoft.com/download) installed.
 - **ilspycmd** installed (for `csharp-decompiler`):
   ```bash
   dotnet tool install -g ilspycmd
@@ -29,6 +30,9 @@ A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/
 # Build and publish framework-dependent single-file binary into csharp-definition-lookup/scripts/
 .\tools\build.ps1
 
+# Build standalone Native AOT binary (outputs to artifacts/apilookup-<rid>-aot/, zero .NET runtime required)
+.\tools\build.ps1 -Aot -Runtime win-x64
+
 # Run unit tests
 dotnet test .\ApiLookup.sln -c Release
 ```
@@ -38,6 +42,7 @@ dotnet test .\ApiLookup.sln -c Release
 Cross-platform & global tool options:
 - Run from source: `dotnet run --project src/ApiLookup -- <args>`
 - Publish single-file: `.\tools\build.ps1 -Runtime linux-x64` (or `osx-arm64`)
+- Publish standalone Native AOT: `.\tools\build.ps1 -Aot -Runtime linux-x64` (or `osx-arm64`, `win-x64`)
 - Install as `.NET Tool`: `dotnet pack src/ApiLookup -c Release -o artifacts && dotnet tool install -g --add-source artifacts ApiLookup`
 
 ---
@@ -120,16 +125,17 @@ csharp-decompiler (ilspycmd)          ──►  Full C# decompiled implementati
 ApiLookup.sln
 Directory.Build.props
 .github/workflows/ci.yml
+.github/workflows/release.yml
 src/
-  ApiLookup/               # .NET 8 CLI (System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5)
+  ApiLookup/               # .NET 8 / Native AOT CLI (System.Reflection.Metadata + Microsoft.Data.Sqlite FTS5)
     Cli/                   # Command catalog (options/arity per command), parser, handlers, help & build info
-    Extraction/            # Metadata, constants/nullability, signature decoder, tokenizer & source resolver
+    Extraction/            # Metadata, constants/nullability, TypeSig single-pass decoder, tokenizer & stat-cached source resolver
     Formatting/            # Text/JSON formatters + camelCase System.Text.Json source-gen context
     Models/                # Extracted & query DTO records, well-known names and kind constants
-    Storage/               # Schema, row readers, index catalog, async streaming builder, SQLite query store
+    Storage/               # Schema, row readers, index catalog, async streaming builder, inheritdoc resolver, SQLite store
   ApiLookup.Tests/         # xUnit unit & integration tests
 tools/
-  build.ps1                # Publishes apilookup binary to csharp-definition-lookup/scripts/
+  build.ps1                # Publishes framework-dependent single-file or Native AOT apilookup binary
 csharp-definition-lookup/
   SKILL.md                 # Skill guide for AI agents
   scripts/

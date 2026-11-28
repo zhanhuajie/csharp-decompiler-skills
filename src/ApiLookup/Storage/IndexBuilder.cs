@@ -7,6 +7,37 @@ namespace ApiLookup;
 
 public static class IndexBuilder
 {
+    /// <summary>
+    /// Identity of the extractor that produced an index. Part of every fingerprint, so upgrading the tool (which may
+    /// change signatures, docs, or tokens without a schema change) rebuilds cached indexes automatically.
+    /// </summary>
+    private static readonly string ToolIdentity =
+        BuildInfo.GetSourceHash() ?? typeof(IndexBuilder).Assembly.GetName().Version?.ToString() ?? "dev";
+
+    private static string EffectiveFingerprint(bool includeNonPublic, string fingerprint)
+        => $"{IndexSchema.Version}|{ToolIdentity}|{(includeNonPublic ? "all" : "pub")}|{fingerprint}";
+
+    /// <summary>
+    /// Fast path that avoids opening any assembly: reuses the index when its recorded stat fingerprint (paths, sizes,
+    /// mtimes and XML companions of every discovered candidate) still matches.
+    /// </summary>
+    public static bool TryOpenFresh(
+        string dbPath,
+        string? indexName,
+        DiscoveredSources discovered,
+        bool includeNonPublic,
+        out (IndexStore Store, IndexStats Stats) result)
+    {
+        result = default;
+        if (discovered.Candidates.Count == 0) return false;
+
+        var sw = Stopwatch.StartNew();
+        if (!TryOpenMatching(dbPath, "stat_fingerprint", EffectiveFingerprint(includeNonPublic, discovered.StatFingerprint), out var store))
+            return false;
+
+        result = (store!, store!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds));
+        return true;
+    }
     public static (IndexStore Store, IndexStats Stats) EnsureBuilt(
         string dbPath,
         string? indexName,
@@ -14,17 +45,22 @@ public static class IndexBuilder
         string sourceDescription,
         bool includeNonPublic,
         bool forceRebuild,
-        List<string>? warnings = null)
+        List<string>? warnings = null,
+        Action<string>? diagnostics = null)
     {
         var sw = Stopwatch.StartNew();
         var dir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
 
-        var effectiveFingerprint = $"{IndexSchema.Version}|{(includeNonPublic ? "all" : "pub")}|{sources.Fingerprint}";
+        var effectiveFingerprint = EffectiveFingerprint(includeNonPublic, sources.Fingerprint);
+        var effectiveStatFingerprint = sources.StatFingerprint != null ? EffectiveFingerprint(includeNonPublic, sources.StatFingerprint) : null;
 
-        if (!forceRebuild && TryOpenMatching(dbPath, effectiveFingerprint, out var fastStore))
+        if (!forceRebuild && TryOpenMatching(dbPath, "fingerprint", effectiveFingerprint, out var fastStore))
         {
+            // Content unchanged but file metadata moved (e.g. a non-managed DLL was touched): refresh the stat fingerprint
+            // so the next query takes the no-probe fast path again.
+            RefreshStatFingerprint(fastStore!, effectiveStatFingerprint);
             var stats = fastStore!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds);
             return (fastStore, stats);
         }
@@ -32,8 +68,9 @@ public static class IndexBuilder
         using var buildLock = IndexCatalog.AcquireBuildLock(dbPath);
 
         // Re-check after acquiring the cross-process lock in case another process just completed the build.
-        if (!forceRebuild && TryOpenMatching(dbPath, effectiveFingerprint, out var lockedFastStore))
+        if (!forceRebuild && TryOpenMatching(dbPath, "fingerprint", effectiveFingerprint, out var lockedFastStore))
         {
+            RefreshStatFingerprint(lockedFastStore!, effectiveStatFingerprint);
             var stats = lockedFastStore!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds);
             return (lockedFastStore, stats);
         }
@@ -45,7 +82,7 @@ public static class IndexBuilder
         {
             if (File.Exists(tempPath)) File.Delete(tempPath);
 
-            var channel = Channel.CreateBounded<ExtractedAssembly>(new BoundedChannelOptions(Math.Max(4, Environment.ProcessorCount * 2))
+            var channel = Channel.CreateBounded<PreparedAssembly>(new BoundedChannelOptions(Math.Max(4, Environment.ProcessorCount * 2))
             {
                 SingleWriter = false,
                 SingleReader = true,
@@ -53,6 +90,7 @@ public static class IndexBuilder
             });
 
             var extractWarnings = new ConcurrentBag<string>();
+            long extractTicks = 0;
             var parallelOptions = new ParallelOptions { CancellationToken = producerCts.Token };
             producerTask = Task.Run(async () =>
             {
@@ -61,11 +99,13 @@ public static class IndexBuilder
                     await Parallel.ForEachAsync(sources.Assemblies, parallelOptions, async (asm, ct) =>
                     {
                         var localWarnings = new List<string>();
+                        var extractStart = Stopwatch.GetTimestamp();
                         var extracted = MetadataExtractor.Extract(asm, includeNonPublic, localWarnings);
+                        Interlocked.Add(ref extractTicks, Stopwatch.GetTimestamp() - extractStart);
                         foreach (var w in localWarnings)
                             extractWarnings.Add(w);
                         if (extracted != null)
-                            await channel.Writer.WriteAsync(extracted, ct).ConfigureAwait(false);
+                            await channel.Writer.WriteAsync(PreparedAssembly.Create(extracted), ct).ConfigureAwait(false);
                     }).ConfigureAwait(false);
                     channel.Writer.Complete();
                 }
@@ -86,19 +126,29 @@ PRAGMA cache_size = -64000;
 ");
                 CreateTables(conn);
 
+                var phase = Stopwatch.StartNew();
                 using (var tx = conn.BeginTransaction())
                 {
-                    InsertFromChannel(conn, tx, channel.Reader, indexName, effectiveFingerprint, sourceDescription);
+                    var insertTicks = InsertFromChannel(conn, tx, channel.Reader, indexName, effectiveFingerprint, effectiveStatFingerprint, sourceDescription);
                     producerTask.GetAwaiter().GetResult();
                     tx.Commit();
+                    diagnostics?.Invoke($"extract+insert {phase.ElapsedMilliseconds} ms wall (extraction {Stopwatch.GetElapsedTime(0, extractTicks).TotalMilliseconds:F0} ms CPU across workers, inserts {Stopwatch.GetElapsedTime(0, insertTicks).TotalMilliseconds:F0} ms)");
                 }
 
+                phase.Restart();
                 CreateIndexes(conn);
+                diagnostics?.Invoke($"secondary indexes {phase.ElapsedMilliseconds} ms");
+
+                phase.Restart();
                 InheritDocResolver.Resolve(conn);
+                diagnostics?.Invoke($"inheritdoc resolution {phase.ElapsedMilliseconds} ms");
+
+                phase.Restart();
                 ExecuteNonQuery(conn, @"
 INSERT INTO fts_entries(fts_entries) VALUES('optimize');
 ANALYZE;
 ");
+                diagnostics?.Invoke($"fts optimize + analyze {phase.ElapsedMilliseconds} ms");
             }
 
             foreach (var w in extractWarnings)
@@ -153,7 +203,7 @@ ANALYZE;
         }
     }
 
-    private static bool TryOpenMatching(string dbPath, string expectedFingerprint, out IndexStore? store)
+    private static bool TryOpenMatching(string dbPath, string metaKey, string expectedFingerprint, out IndexStore? store)
     {
         store = null;
         if (!File.Exists(dbPath)) return false;
@@ -162,7 +212,7 @@ ANALYZE;
         try
         {
             candidate = IndexStore.OpenReadOnly(dbPath);
-            if (candidate.GetMeta("fingerprint") == expectedFingerprint &&
+            if (candidate.GetMeta(metaKey) == expectedFingerprint &&
                 candidate.GetMeta("schema_version") == IndexSchema.Version)
             {
                 store = candidate;
@@ -182,16 +232,37 @@ ANALYZE;
         return false;
     }
 
+    private static void RefreshStatFingerprint(IndexStore store, string? effectiveStatFingerprint)
+    {
+        if (effectiveStatFingerprint == null || store.GetMeta("stat_fingerprint") == effectiveStatFingerprint)
+            return;
+        try
+        {
+            using var conn = new SqliteConnection($"Data Source={store.DbPath};Mode=ReadWrite;Pooling=False");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO meta(key, value) VALUES('stat_fingerprint', $v)";
+            cmd.Parameters.AddWithValue("$v", effectiveStatFingerprint);
+            cmd.ExecuteNonQuery();
+        }
+        catch
+        {
+            // Best effort: a read-only or locked database just keeps using the slower probe path.
+        }
+    }
+
     private static void CreateTables(SqliteConnection conn) => ExecuteNonQuery(conn, IndexSchema.CreateTablesSql);
 
     private static void CreateIndexes(SqliteConnection conn) => ExecuteNonQuery(conn, IndexSchema.CreateIndexesSql);
 
-    private static void InsertFromChannel(
+    /// <returns>Stopwatch ticks spent writing rows (excluding time waiting for extraction).</returns>
+    private static long InsertFromChannel(
         SqliteConnection conn,
         SqliteTransaction tx,
-        ChannelReader<ExtractedAssembly> reader,
+        ChannelReader<PreparedAssembly> reader,
         string? indexName,
         string fingerprint,
+        string? statFingerprint,
         string sourceDescription)
     {
         using var metaCmd = conn.CreateCommand();
@@ -209,6 +280,8 @@ ANALYZE;
 
         PutMeta("schema_version", IndexSchema.Version);
         PutMeta("fingerprint", fingerprint);
+        if (statFingerprint != null)
+            PutMeta("stat_fingerprint", statFingerprint);
         PutMeta("built_at_utc", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
         PutMeta("sources", sourceDescription);
         if (!string.IsNullOrWhiteSpace(indexName))
@@ -332,10 +405,13 @@ VALUES($rowid, $et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
         long nextTypeId = 0;
         long nextMemId = 0;
 
+        long insertTicks = 0;
         while (reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
         {
-            while (reader.TryRead(out var asm))
+            while (reader.TryRead(out var prepared))
             {
+                var asmStart = Stopwatch.GetTimestamp();
+                var asm = prepared.Assembly;
                 var asmId = ++nextAsmId;
                 pAsmId.Value = asmId;
                 pAsmName.Value = asm.Name;
@@ -347,8 +423,9 @@ VALUES($rowid, $et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                 pAsmTCount.Value = asm.Types.Count;
                 asmCmd.ExecuteNonQuery();
 
-                foreach (var t in asm.Types)
+                for (var ti = 0; ti < asm.Types.Count; ti++)
                 {
+                    var t = asm.Types[ti];
                     var typeId = ++nextTypeId;
                     pTId.Value = typeId;
                     pTAid.Value = asmId;
@@ -393,12 +470,13 @@ VALUES($rowid, $et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                     pFNs.Value = t.Namespace;
                     pFFull.Value = t.FullName;
                     pFName.Value = t.SimpleName;
-                    pFTokens.Value = BuildTypeTokens(t.SimpleName, t.FullName, t.BaseSimple, t.Interfaces, t.Summary);
+                    pFTokens.Value = prepared.TypeTokens[ti];
                     pFSum.Value = t.Summary ?? string.Empty;
                     ftsCmd.ExecuteNonQuery();
 
-                    foreach (var m in t.Members)
+                    for (var mi = 0; mi < t.Members.Count; mi++)
                     {
+                        var m = t.Members[mi];
                         var memId = ++nextMemId;
                         pMId.Value = memId;
                         pMTid.Value = typeId;
@@ -450,12 +528,40 @@ VALUES($rowid, $et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         pFNs.Value = t.Namespace;
                         pFFull.Value = $"{t.FullName}.{m.Name}";
                         pFName.Value = m.Name;
-                        pFTokens.Value = BuildMemberTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes, m.Summary);
+                        pFTokens.Value = prepared.MemberTokens[ti][mi];
                         pFSum.Value = m.Summary ?? string.Empty;
                         ftsCmd.ExecuteNonQuery();
                     }
                 }
+                insertTicks += Stopwatch.GetTimestamp() - asmStart;
             }
+        }
+        return insertTicks;
+    }
+
+    /// <summary>
+    /// An extracted assembly plus its precomputed FTS token strings. Tokenization (regex + CamelCase/CJK expansion) runs
+    /// on the parallel extraction workers so the single SQLite writer thread only binds parameters and inserts rows.
+    /// </summary>
+    private sealed record PreparedAssembly(ExtractedAssembly Assembly, string[] TypeTokens, string[][] MemberTokens)
+    {
+        public static PreparedAssembly Create(ExtractedAssembly asm)
+        {
+            var typeTokens = new string[asm.Types.Count];
+            var memberTokens = new string[asm.Types.Count][];
+            for (var i = 0; i < asm.Types.Count; i++)
+            {
+                var t = asm.Types[i];
+                typeTokens[i] = BuildTypeTokens(t.SimpleName, t.FullName, t.BaseSimple, t.Interfaces, t.Summary);
+                var tokens = new string[t.Members.Count];
+                for (var j = 0; j < t.Members.Count; j++)
+                {
+                    var m = t.Members[j];
+                    tokens[j] = BuildMemberTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes, m.Summary);
+                }
+                memberTokens[i] = tokens;
+            }
+            return new PreparedAssembly(asm, typeTokens, memberTokens);
         }
     }
 

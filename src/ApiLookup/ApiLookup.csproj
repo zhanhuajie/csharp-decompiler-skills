@@ -5,8 +5,9 @@
     <AssemblyName>apilookup</AssemblyName>
     <PackageId>ApiLookup</PackageId>
     <RootNamespace>ApiLookup</RootNamespace>
-    <PackAsTool Condition="'$(PublishSingleFile)' != 'true'">true</PackAsTool>
+    <PackAsTool Condition="'$(PublishSingleFile)' != 'true' And '$(PublishAot)' != 'true'">true</PackAsTool>
     <ToolCommandName>apilookup</ToolCommandName>
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>

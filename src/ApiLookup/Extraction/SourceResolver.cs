@@ -16,10 +16,34 @@ public sealed record ResolvedAssembly(
     long FileSize = 0,
     long MtimeUtc = 0);
 
+/// <param name="StatFingerprint">Fingerprint of the discovered candidate files (see <see cref="DiscoveredSources"/>).</param>
 public sealed record ResolvedSources(
     IReadOnlyList<ResolvedAssembly> Assemblies,
     string SourceKey,
     string Fingerprint,
+    IReadOnlyList<string> Warnings,
+    string? StatFingerprint = null);
+
+/// <summary>A binary that may be a managed assembly; only file-system metadata has been read so far.</summary>
+public sealed record SourceCandidate(
+    string FullPath,
+    string Group,
+    string? XmlPath,
+    long FileSize,
+    long MtimeUtc,
+    bool IsDirect,
+    long XmlFileSize = -1,
+    long XmlMtimeUtc = 0);
+
+/// <summary>
+/// Result of the cheap discovery phase: candidate binaries with size/mtime (no file contents opened).
+/// <see cref="StatFingerprint"/> hashes every candidate's path, size, mtime and XML companion, so an up-to-date index
+/// can be reused without opening thousands of PE headers (<see cref="SourceResolver.Probe"/>).
+/// </summary>
+public sealed record DiscoveredSources(
+    IReadOnlyList<SourceCandidate> Candidates,
+    string SourceKey,
+    string StatFingerprint,
     IReadOnlyList<string> Warnings);
 
 public static partial class SourceResolver
@@ -27,8 +51,9 @@ public static partial class SourceResolver
     [GeneratedRegex(@"\$\(([^)]+)\)")]
     private static partial Regex MsBuildMacroRegex();
 
-    private sealed record CandidateBinary(string FullPath, string Group, string? PrefoundXml);
+    private const int ParallelThreshold = 8;
 
+    /// <summary>Discovers and probes sources in one step (equivalent to <c>Probe(Discover(...))</c>).</summary>
     public static ResolvedSources Resolve(
         IReadOnlyList<string> projectPaths,
         IReadOnlyList<string> dirPaths,
@@ -38,9 +63,23 @@ public static partial class SourceResolver
         IReadOnlyList<string>? excludePatterns = null,
         bool includeNonPublic = false,
         string? targetFramework = null)
+        => Probe(Discover(projectPaths, dirPaths, dllPaths, recursive, includePatterns, excludePatterns, includeNonPublic, targetFramework));
+
+    /// <summary>
+    /// Enumerates candidate binaries from <c>--dll</c>, <c>--dir</c>, and <c>--project</c> sources using only
+    /// directory listings and file metadata. No assembly is opened.
+    /// </summary>
+    public static DiscoveredSources Discover(
+        IReadOnlyList<string> projectPaths,
+        IReadOnlyList<string> dirPaths,
+        IReadOnlyList<string> dllPaths,
+        bool recursive = true,
+        IReadOnlyList<string>? includePatterns = null,
+        IReadOnlyList<string>? excludePatterns = null,
+        bool includeNonPublic = false,
+        string? targetFramework = null)
     {
-        var results = new List<ResolvedAssembly>();
-        var candidates = new List<CandidateBinary>();
+        var candidates = new List<SourceCandidate>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var warnings = new List<string>();
         var keyParts = new List<string>
@@ -55,9 +94,8 @@ public static partial class SourceResolver
         foreach (var inc in includes) keyParts.Add("inc:" + inc.ToLowerInvariant());
         foreach (var exc in excludes) keyParts.Add("exc:" + exc.ToLowerInvariant());
 
-        bool MatchesFilters(string fullPath, bool applyFilters)
+        bool MatchesFilters(string fullPath)
         {
-            if (!applyFilters) return true;
             var fileName = Path.GetFileName(fullPath);
             if (includes.Count > 0 && !includes.Any(p => MatchesGlob(fileName, p)))
                 return false;
@@ -66,42 +104,42 @@ public static partial class SourceResolver
             return true;
         }
 
-        void EnqueueCandidate(string fullPath, string group, bool applyFilters = true, string? prefoundXml = null)
+        bool EnqueueCandidate(string fullPath, string group, string? prefoundXml = null, FileInfo? info = null)
         {
-            if (!File.Exists(fullPath)) return;
             if (!fullPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) &&
                 !fullPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                return;
+                return false;
             if (fullPath.EndsWith(".resources.dll", StringComparison.OrdinalIgnoreCase) ||
                 fullPath.EndsWith(".vshost.exe", StringComparison.OrdinalIgnoreCase))
-                return;
-            if (!MatchesFilters(fullPath, applyFilters)) return;
-            if (!seen.Add(fullPath)) return;
+                return false;
+            if (!MatchesFilters(fullPath)) return false;
 
-            candidates.Add(new CandidateBinary(fullPath, group, prefoundXml));
+            info ??= new FileInfo(fullPath);
+            if (!info.Exists) return false;
+            if (!seen.Add(fullPath)) return false;
+
+            candidates.Add(new SourceCandidate(fullPath, group, prefoundXml, info.Length, info.LastWriteTimeUtc.Ticks, IsDirect: false));
+            return true;
         }
 
+        var xmlCache = new DirectoryXmlCache();
+
+        var directCount = 0;
         foreach (var raw in dllPaths)
         {
             var full = Path.GetFullPath(raw);
             keyParts.Add("dll:" + full.ToLowerInvariant());
-            if (!File.Exists(full))
+            var fi = new FileInfo(full);
+            if (!fi.Exists)
             {
                 warnings.Add($"DLL not found: {full}");
                 continue;
             }
+            // Explicit --dll paths bypass extension and include/exclude filters.
             if (seen.Add(full))
             {
-                if (HasManagedMetadata(full))
-                {
-                    var fi = new FileInfo(full);
-                    var xmlPath = XmlDocReader.FindXmlDocPath(full);
-                    results.Add(new ResolvedAssembly(full, "Direct DLL", xmlPath, fi.Length, fi.LastWriteTimeUtc.Ticks));
-                }
-                else
-                {
-                    warnings.Add($"Skipping non-managed binary (no CLR metadata): {full}");
-                }
+                candidates.Add(new SourceCandidate(full, "Direct DLL", null, fi.Length, fi.LastWriteTimeUtc.Ticks, IsDirect: true));
+                directCount++;
             }
         }
 
@@ -117,8 +155,8 @@ public static partial class SourceResolver
 
             try
             {
-                foreach (var file in EnumerateBinariesSafe(full, recursive))
-                    EnqueueCandidate(file, full);
+                foreach (var file in EnumerateBinariesSafe(full, recursive, xmlCache))
+                    EnqueueCandidate(file.FullName, full, info: file);
             }
             catch (Exception ex)
             {
@@ -136,16 +174,14 @@ public static partial class SourceResolver
                 continue;
             }
 
-            var projectCandidates = new List<CandidateBinary>();
+            var projectCandidateCount = 0;
             var projectDir = Path.GetDirectoryName(full)!;
             var assetsPath = Path.Combine(projectDir, "obj", "project.assets.json");
             if (File.Exists(assetsPath))
             {
                 foreach (var (dll, group, xmlPath) in ResolveFromAssets(assetsPath, projectDir, targetFramework, warnings))
                 {
-                    var before = candidates.Count;
-                    EnqueueCandidate(dll, group, prefoundXml: xmlPath);
-                    if (candidates.Count > before) projectCandidates.Add(candidates[^1]);
+                    if (EnqueueCandidate(dll, group, prefoundXml: xmlPath)) projectCandidateCount++;
                 }
             }
             else
@@ -155,100 +191,247 @@ public static partial class SourceResolver
 
             foreach (var hintDll in GetCsprojHintPaths(full, warnings))
             {
-                var before = candidates.Count;
-                EnqueueCandidate(hintDll, "HintPath");
-                if (candidates.Count > before) projectCandidates.Add(candidates[^1]);
+                if (EnqueueCandidate(hintDll, "HintPath")) projectCandidateCount++;
             }
 
-            if (projectCandidates.Count == 0 && results.Count == 0)
+            if (projectCandidateCount == 0 && directCount == 0)
                 warnings.Add($"No managed DLL references found for project: {full}");
         }
 
-        // Probe candidate PE headers and XML companion docs in parallel for large directories/projects
-        if (candidates.Count <= 8)
+        // XML companion lookup reuses cached directory *.xml listings from the scan above (or scans lazily per dir).
+        var withXml = new SourceCandidate[candidates.Count];
+        void FillXml(int i)
         {
-            foreach (var c in candidates)
+            var c = candidates[i];
+            if (c.XmlPath != null)
             {
-                var probed = ProbeCandidate(c);
-                if (probed != null) results.Add(probed);
+                var xfi = new FileInfo(c.XmlPath);
+                withXml[i] = xfi.Exists ? c with { XmlFileSize = xfi.Length, XmlMtimeUtc = xfi.LastWriteTimeUtc.Ticks } : c;
+                return;
             }
-        }
-        else
-        {
-            var bag = new ConcurrentBag<ResolvedAssembly>();
-            Parallel.ForEach(candidates, c =>
-            {
-                var probed = ProbeCandidate(c);
-                if (probed != null) bag.Add(probed);
-            });
-            results.AddRange(bag);
-        }
 
-        results.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Path, b.Path));
+            var xmlFileName = Path.GetFileName(Path.ChangeExtension(c.FullPath, ".xml"));
+            withXml[i] = xmlCache.TryFind(Path.GetDirectoryName(c.FullPath), xmlFileName, out var xmlMeta)
+                ? c with { XmlPath = xmlMeta.FullPath, XmlFileSize = xmlMeta.Size, XmlMtimeUtc = xmlMeta.MtimeUtc }
+                : c;
+        }
+        if (candidates.Count <= ParallelThreshold)
+            for (var i = 0; i < candidates.Count; i++) FillXml(i);
+        else
+            Parallel.For(0, candidates.Count, FillXml);
+
+        Array.Sort(withXml, (a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.FullPath, b.FullPath));
         keyParts.Sort(StringComparer.OrdinalIgnoreCase);
 
-        var sourceKey = ComputeSha256(string.Join("\n", keyParts))[..16];
-        var fpBuilder = new StringBuilder();
-        foreach (var asm in results)
+        var statBuilder = new StringBuilder();
+        foreach (var c in withXml)
         {
-            fpBuilder.Append(asm.Path.ToLowerInvariant())
-                .Append('|').Append(asm.FileSize)
-                .Append('|').Append(asm.MtimeUtc);
+            statBuilder.Append(c.FullPath.ToLowerInvariant())
+                .Append('|').Append(c.FileSize)
+                .Append('|').Append(c.MtimeUtc)
+                .Append('|').Append(c.Group);
+            AppendXmlStat(statBuilder, c.XmlPath, c.XmlFileSize, c.XmlMtimeUtc);
+            statBuilder.Append('\n');
+        }
 
-            if (asm.XmlPath != null && File.Exists(asm.XmlPath))
-            {
-                var xfi = new FileInfo(asm.XmlPath);
-                fpBuilder.Append("|xml:").Append(xfi.Length).Append(':').Append(xfi.LastWriteTimeUtc.Ticks);
-            }
+        return new DiscoveredSources(
+            withXml,
+            ComputeSha256(string.Join("\n", keyParts))[..16],
+            ComputeSha256(statBuilder.ToString()),
+            warnings);
+    }
+
+    /// <summary>
+    /// Opens each candidate's PE header to keep only managed assemblies, and computes the content fingerprint used to
+    /// decide whether an existing index must be rebuilt.
+    /// </summary>
+    public static ResolvedSources Probe(DiscoveredSources discovered)
+    {
+        var candidates = discovered.Candidates;
+        var probed = new (ResolvedAssembly Asm, long XmlSize, long XmlMtime)?[candidates.Count];
+        void ProbeAt(int i)
+        {
+            var c = candidates[i];
+            if (HasManagedMetadata(c.FullPath))
+                probed[i] = (new ResolvedAssembly(c.FullPath, c.Group, c.XmlPath, c.FileSize, c.MtimeUtc), c.XmlFileSize, c.XmlMtimeUtc);
+        }
+        if (candidates.Count <= ParallelThreshold)
+            for (var i = 0; i < candidates.Count; i++) ProbeAt(i);
+        else
+            Parallel.For(0, candidates.Count, ProbeAt);
+
+        var warnings = new List<string>(discovered.Warnings);
+        var probedList = new List<(ResolvedAssembly Asm, long XmlSize, long XmlMtime)>(candidates.Count);
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            if (probed[i] is { } item)
+                probedList.Add(item);
+            else if (candidates[i].IsDirect)
+                warnings.Add($"Skipping non-managed binary (no CLR metadata): {candidates[i].FullPath}");
+        }
+        probedList.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Asm.Path, b.Asm.Path));
+
+        var fpBuilder = new StringBuilder();
+        foreach (var item in probedList)
+        {
+            fpBuilder.Append(item.Asm.Path.ToLowerInvariant())
+                .Append('|').Append(item.Asm.FileSize)
+                .Append('|').Append(item.Asm.MtimeUtc);
+            AppendXmlStat(fpBuilder, item.Asm.XmlPath, item.XmlSize, item.XmlMtime);
             fpBuilder.Append('\n');
         }
-        var fingerprint = ComputeSha256(fpBuilder.ToString());
 
-        return new ResolvedSources(results, sourceKey, fingerprint, warnings);
+        var results = probedList.ConvertAll(p => p.Asm);
+        return new ResolvedSources(results, discovered.SourceKey, ComputeSha256(fpBuilder.ToString()), warnings, discovered.StatFingerprint);
     }
 
-    private static ResolvedAssembly? ProbeCandidate(CandidateBinary c)
+    private static void AppendXmlStat(StringBuilder sb, string? xmlPath, long xmlFileSize, long xmlMtimeUtc)
     {
-        if (!HasManagedMetadata(c.FullPath)) return null;
-        var fi = new FileInfo(c.FullPath);
-        var xmlPath = c.PrefoundXml ?? XmlDocReader.FindXmlDocPath(c.FullPath);
-        return new ResolvedAssembly(c.FullPath, c.Group, xmlPath, fi.Length, fi.LastWriteTimeUtc.Ticks);
+        if (xmlPath == null) return;
+        if (xmlFileSize >= 0)
+        {
+            sb.Append("|xml:").Append(xmlFileSize).Append(':').Append(xmlMtimeUtc);
+            return;
+        }
+        var xfi = new FileInfo(xmlPath);
+        if (xfi.Exists)
+            sb.Append("|xml:").Append(xfi.Length).Append(':').Append(xfi.LastWriteTimeUtc.Ticks);
     }
 
-    private static IEnumerable<string> EnumerateBinariesSafe(string root, bool recursive)
+    private readonly record struct XmlFileMeta(string FullPath, long Size, long MtimeUtc);
+
+    /// <summary>
+    /// Per-directory index of companion XML docs (root dir + <see cref="XmlDocReader.LocaleSubdirs"/>) populated
+    /// during the single directory-listing pass, avoiding thousands of per-file <c>File.Exists</c> / <c>FileInfo</c> syscalls.
+    /// </summary>
+    private sealed class DirectoryXmlCache
     {
-        var stack = new Stack<string>();
-        stack.Push(root);
+        private static readonly StringComparer FileNameComparer =
+            OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+
+        private static readonly HashSet<string> LocaleSubdirSet =
+            new(XmlDocReader.LocaleSubdirs, FileNameComparer);
+
+        private readonly ConcurrentDictionary<string, Dictionary<string, XmlFileMeta>> _byDir =
+            new(OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase);
+
+        public static bool IsLocaleXmlDir(string name) => LocaleSubdirSet.Contains(name);
+
+        public static string NormalizeDirKey(string dirPath)
+        {
+            var root = Path.GetPathRoot(dirPath);
+            if (!string.IsNullOrEmpty(root) && dirPath.Length <= root.Length)
+                return dirPath;
+            return Path.TrimEndingDirectorySeparator(dirPath);
+        }
+
+        public void RecordDirectory(
+            string dirPath,
+            Dictionary<string, XmlFileMeta> rootXmls,
+            Dictionary<string, DirectoryInfo>? existingLocaleDirs)
+        {
+            if (existingLocaleDirs is { Count: > 0 })
+            {
+                // Preserve exact LocaleSubdirs precedence and never overwrite a root XML doc.
+                foreach (var sub in XmlDocReader.LocaleSubdirs)
+                {
+                    if (!existingLocaleDirs.TryGetValue(sub, out var subDir)) continue;
+                    TryAddXmlFiles(subDir, rootXmls);
+                }
+            }
+            _byDir[NormalizeDirKey(dirPath)] = rootXmls;
+        }
+
+        public bool TryFind(string? dirPath, string xmlFileName, out XmlFileMeta meta)
+        {
+            if (string.IsNullOrEmpty(dirPath))
+            {
+                meta = default;
+                return false;
+            }
+            var map = _byDir.GetOrAdd(NormalizeDirKey(dirPath), ScanDirectory);
+            return map.TryGetValue(xmlFileName, out meta);
+        }
+
+        private static Dictionary<string, XmlFileMeta> ScanDirectory(string dirPath)
+        {
+            var map = new Dictionary<string, XmlFileMeta>(FileNameComparer);
+            TryAddXmlFiles(new DirectoryInfo(dirPath), map);
+            foreach (var sub in XmlDocReader.LocaleSubdirs)
+            {
+                var subDir = new DirectoryInfo(Path.Combine(dirPath, sub));
+                if (!subDir.Exists) continue;
+                TryAddXmlFiles(subDir, map);
+            }
+            return map;
+        }
+
+        private static void TryAddXmlFiles(DirectoryInfo dir, Dictionary<string, XmlFileMeta> map)
+        {
+            FileInfo[] xmls;
+            try { xmls = dir.GetFiles("*.xml"); }
+            catch { return; }
+
+            foreach (var f in xmls)
+                map.TryAdd(f.Name, new XmlFileMeta(f.FullName, f.Length, f.LastWriteTimeUtc.Ticks));
+        }
+    }
+
+    /// <summary>
+    /// Lists <c>*.dll</c>/<c>*.exe</c> files in a single directory-listing pass per folder while caching companion
+    /// <c>*.xml</c> metadata for that folder and its existing locale subfolders.
+    /// </summary>
+    private static IEnumerable<FileInfo> EnumerateBinariesSafe(string root, bool recursive, DirectoryXmlCache xmlCache)
+    {
+        var fileNameComparer = OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+        var stack = new Stack<DirectoryInfo>();
+        stack.Push(new DirectoryInfo(root));
         while (stack.Count > 0)
         {
             var dir = stack.Pop();
-            string[] dlls;
-            try { dlls = Directory.GetFiles(dir, "*.dll"); }
+            FileSystemInfo[] entries;
+            try { entries = dir.GetFileSystemInfos(); }
             catch { continue; }
 
-            foreach (var f in dlls)
-                yield return f;
+            var binaries = new List<FileInfo>();
+            var rootXmls = new Dictionary<string, XmlFileMeta>(fileNameComparer);
+            Dictionary<string, DirectoryInfo>? existingLocaleDirs = null;
+            List<DirectoryInfo>? childDirs = recursive ? new List<DirectoryInfo>() : null;
 
-            string[] exes;
-            try { exes = Directory.GetFiles(dir, "*.exe"); }
-            catch { exes = Array.Empty<string>(); }
-
-            foreach (var f in exes)
-                yield return f;
-
-            if (!recursive) continue;
-
-            string[] subdirs;
-            try { subdirs = Directory.GetDirectories(dir); }
-            catch { continue; }
-
-            foreach (var sub in subdirs)
+            foreach (var entry in entries)
             {
-                var name = Path.GetFileName(sub);
-                // Skip localized satellite folders like en-US, zh-CN, ja-JP when scanning big install dirs
-                if (IsLikelyLocaleDir(name)) continue;
-                stack.Push(sub);
+                if (entry is FileInfo fi)
+                {
+                    if (fi.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ||
+                        fi.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        binaries.Add(fi);
+                    }
+                    else if (fi.Name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                    {
+                        rootXmls.TryAdd(fi.Name, new XmlFileMeta(fi.FullName, fi.Length, fi.LastWriteTimeUtc.Ticks));
+                    }
+                }
+                else if (entry is DirectoryInfo sub)
+                {
+                    if (DirectoryXmlCache.IsLocaleXmlDir(sub.Name))
+                        (existingLocaleDirs ??= new Dictionary<string, DirectoryInfo>(fileNameComparer))[sub.Name] = sub;
+
+                    if (childDirs != null && !IsLikelyLocaleDir(sub.Name))
+                        childDirs.Add(sub);
+                }
             }
+
+            xmlCache.RecordDirectory(dir.FullName, rootXmls, existingLocaleDirs);
+
+            if (childDirs != null)
+            {
+                foreach (var sub in childDirs)
+                    stack.Push(sub);
+            }
+
+            foreach (var b in binaries)
+                yield return b;
         }
     }
 

@@ -10,6 +10,7 @@ Offline .NET metadata & XML documentation indexer (`System.Reflection.Metadata` 
 ## Tool Location
 
 - **Windows (ready to run, requires .NET 8+ runtime)**: `<skill_dir>/scripts/apilookup.exe`
+- **Standalone Native AOT (Windows / Linux / macOS, zero .NET runtime required)**: Download `apilookup-<rid>.zip` / `.tar.gz` from [GitHub Releases](../../releases), or build locally with `<repo>/tools/build.ps1 -Aot`
 - **.NET Global/Local Tool**: `dotnet pack <repo>/src/ApiLookup -c Release` then `dotnet tool install -g --add-source <nupkg_dir> ApiLookup` (`apilookup`)
 - **Cross-platform / from source**: `dotnet run --project <repo>/src/ApiLookup -- <args>`
 - **Rebuild binary**: `<repo>/tools/build.ps1`
@@ -36,7 +37,7 @@ Every command accepts any combination of `--dir`, `--project`, `--dll`, or a pre
 - `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first; package roots come from its `packageFolders`, so custom `globalPackagesFolder` / fallback folders work), project references (honoring custom `<AssemblyName>`), plus `<HintPath>` references (expanding `$(ProjectDir)`, `$(SolutionDir)`, and MSBuild properties from `.csproj` / ancestor `Directory.Build.props`). For multi-TFM projects, automatically selects the highest framework or pass `--tfm <tfm>` (e.g. `--tfm net8.0`).
 - `--dll <path.dll>` (repeatable): Index specific assembly files directly.
 - `--index <name>` (alias `--name`): Build once with `index --name <name> ...`, then reuse instantly (`<50 ms`) across queries.
-- Ad-hoc `--dir`/`--project`/`--dll` queries are **auto-cached** by file size + mtime fingerprint in `%LOCALAPPDATA%\csharp-api-lookup\indexes\` (or `~/.cache/csharp-api-lookup/indexes/`, overridable via `APILOOKUP_CACHE_DIR`). Run `apilookup.exe index --prune` to clean up old `auto-*.db` files and leftover temp files from interrupted builds.
+- Ad-hoc `--dir`/`--project`/`--dll` queries are **auto-cached** by directory stat fingerprint (paths, sizes, mtimes, and companion `.xml` files) in `%LOCALAPPDATA%\csharp-api-lookup\indexes\` (or `~/.cache/csharp-api-lookup/indexes/`, overridable via `APILOOKUP_CACHE_DIR`). Cache hits on `--dir` skip opening every binary's PE header; run `apilookup.exe index --prune` to clean up old `auto-*.db` files and leftover temp files from interrupted builds.
 
 ## Recommended Workflows
 
@@ -112,7 +113,7 @@ Escalate to `csharp-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when
 - **Filter large install directories** with `--include` / `--exclude` (e.g. `--exclude "DevExpress.*"`) to avoid indexing hundreds of bundled third-party UI DLLs.
 - **Non-public members**: By default only `public` and `protected` APIs are indexed (which also strips C++/CLI native internal structs). Pass `--include-nonpublic` if reverse-engineering internal types.
 - **Structured output**: Any command supports `--json` (emitting consistent `camelCase` JSON, including structured `{ "error", "exitCode" }` envelopes on failure).
-- **Diagnostics & Version**: Pass `--verbose` to inspect metadata/XML warnings and error stack traces on stderr, and `--version` (add `--verbose` for commit/source hash/runtime) to check the CLI version.
+- **Diagnostics & Version**: Pass `--verbose` to inspect metadata/XML warnings, phase timing breakdown (`[timing] ...`), and error stack traces on stderr, and `--version` (add `--verbose` for commit/source hash/runtime) to check the CLI version.
 - **Exit codes**: `0` success, `1` error or type not found, `2` ambiguous type match in `show`/`hierarchy` (candidates printed to stdout).
 - **Strict CLI**: Options are validated per command (e.g. `--role` only on `by-type`, `--member` only on `show`) and mistyped commands like `serach` fail with a suggestion instead of silently searching. A bare word that is not a command (e.g. `apilookup Wall --index revit2026`) is still treated as `search`.
 - **Zero-cache DLL scan**: Use `locate <TypeName>` (alias `scan`) with `--project` / `--dir` / `--dll` when you only want to find which DLL defines or forwards a type without creating a SQLite index.

@@ -60,3 +60,37 @@ jobs:
         run: |
           dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r linux-x64 --no-self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-check
           ./publish-check/apilookup --version --verbose
+
+      - name: Install Native AOT prerequisites (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang zlib1g-dev
+
+      - name: Verify Native AOT publish & smoke test (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r linux-x64 -p:PublishAot=true -p:StripSymbols=true -o publish-aot
+          ./publish-aot/apilookup --version --verbose
+          DLL=src/ApiLookup.Tests/bin/Release/net8.0/ApiLookup.Tests.dll
+          ./publish-aot/apilookup index --db ./publish-aot/smoke.db --dll "$DLL"
+          ./publish-aot/apilookup search "offscreen device" --db ./publish-aot/smoke.db --json > /dev/null
+          ./publish-aot/apilookup show SampleNullability --db ./publish-aot/smoke.db --docs --inherited --ext > /dev/null
+          ./publish-aot/apilookup hierarchy SampleBaseEntity --db ./publish-aot/smoke.db --json > /dev/null
+          ./publish-aot/apilookup by-type SamplePipeSegment --db ./publish-aot/smoke.db --json > /dev/null
+          ./publish-aot/apilookup locate SamplePipeSegment --dll "$DLL" --json > /dev/null
+
+      - name: Verify Native AOT publish & smoke test (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          dotnet publish src/ApiLookup/ApiLookup.csproj -c Release -r win-x64 -p:PublishAot=true -o publish-aot
+          $exe = "./publish-aot/apilookup.exe"
+          $dll = "src/ApiLookup.Tests/bin/Release/net8.0/ApiLookup.Tests.dll"
+          & $exe --version --verbose; if ($LASTEXITCODE -ne 0) { throw "version failed" }
+          & $exe index --db ./publish-aot/smoke.db --dll $dll; if ($LASTEXITCODE -ne 0) { throw "index failed" }
+          & $exe search "offscreen device" --db ./publish-aot/smoke.db --json | Out-Null; if ($LASTEXITCODE -ne 0) { throw "search failed" }
+          & $exe show SampleNullability --db ./publish-aot/smoke.db --docs --inherited --ext | Out-Null; if ($LASTEXITCODE -ne 0) { throw "show failed" }
+          & $exe hierarchy SampleBaseEntity --db ./publish-aot/smoke.db --json | Out-Null; if ($LASTEXITCODE -ne 0) { throw "hierarchy failed" }
+          & $exe by-type SamplePipeSegment --db ./publish-aot/smoke.db --json | Out-Null; if ($LASTEXITCODE -ne 0) { throw "by-type failed" }
+          & $exe locate SamplePipeSegment --dll $dll --json | Out-Null; if ($LASTEXITCODE -ne 0) { throw "locate failed" }

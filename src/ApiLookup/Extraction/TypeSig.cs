@@ -18,7 +18,8 @@ internal sealed record PrimitiveTypeSig(PrimitiveTypeCode Code) : TypeSig
 
 /// <param name="DisplayName">Short C# display name, e.g. <c>List</c> or <c>Outer.Inner</c> (generic arity stripped).</param>
 /// <param name="FullName">Namespace-qualified name with arity stripped, e.g. <c>System.Nullable</c>.</param>
-internal sealed record NamedTypeSig(string DisplayName, string FullName, bool IsValueType) : TypeSig;
+/// <param name="XmlDocName">XML doc ID form with raw arity, e.g. <c>System.Collections.Generic.List`1</c>.</param>
+internal sealed record NamedTypeSig(string DisplayName, string FullName, bool IsValueType, string XmlDocName) : TypeSig;
 
 internal sealed record GenericInstanceTypeSig(NamedTypeSig Definition, ImmutableArray<TypeSig> Arguments) : TypeSig
 {
@@ -32,7 +33,7 @@ internal sealed record ByRefTypeSig(TypeSig Element) : TypeSig;
 
 internal sealed record PointerTypeSig(TypeSig Element) : TypeSig;
 
-internal sealed record GenericParameterTypeSig(string Name, bool IsValueTypeConstrained) : TypeSig;
+internal sealed record GenericParameterTypeSig(string Name, bool IsValueTypeConstrained, int Index, bool IsMethodParameter) : TypeSig;
 
 internal sealed record FunctionPointerTypeSig(MethodSignature<TypeSig> Signature) : TypeSig;
 
@@ -52,7 +53,8 @@ internal sealed class TypeSigProvider : ISignatureTypeProvider<TypeSig, GenericC
         return new NamedTypeSig(
             DisplaySignatureProvider.Instance.GetTypeFromDefinition(reader, handle, rawTypeKind),
             FullNameDisplaySignatureProvider.Instance.GetTypeFromDefinition(reader, handle, rawTypeKind),
-            isValueType);
+            isValueType,
+            XmlDocSignatureProvider.Instance.GetTypeFromDefinition(reader, handle, rawTypeKind));
     }
 
     /// <remarks>
@@ -63,7 +65,8 @@ internal sealed class TypeSigProvider : ISignatureTypeProvider<TypeSig, GenericC
         => new NamedTypeSig(
             DisplaySignatureProvider.Instance.GetTypeFromReference(reader, handle, rawTypeKind),
             FullNameDisplaySignatureProvider.Instance.GetTypeFromReference(reader, handle, rawTypeKind),
-            rawTypeKind == ValueTypeKind);
+            rawTypeKind == ValueTypeKind,
+            XmlDocSignatureProvider.Instance.GetTypeFromReference(reader, handle, rawTypeKind));
 
     public TypeSig GetTypeFromSpecification(MetadataReader reader, GenericContext genericContext, TypeSpecificationHandle handle, byte rawTypeKind)
         => reader.GetTypeSpecification(handle).DecodeSignature(this, genericContext);
@@ -86,13 +89,13 @@ internal sealed class TypeSigProvider : ISignatureTypeProvider<TypeSig, GenericC
     public TypeSig GetGenericTypeParameter(GenericContext genericContext, int index)
     {
         var name = index >= 0 && index < genericContext.TypeParams.Count ? genericContext.TypeParams[index] : $"T{index}";
-        return new GenericParameterTypeSig(name, genericContext.ValueTypeGenericParams?.Contains(name) == true);
+        return new GenericParameterTypeSig(name, genericContext.ValueTypeGenericParams?.Contains(name) == true, index, IsMethodParameter: false);
     }
 
     public TypeSig GetGenericMethodParameter(GenericContext genericContext, int index)
     {
         var name = index >= 0 && index < genericContext.MethodParams.Count ? genericContext.MethodParams[index] : $"TMethod{index}";
-        return new GenericParameterTypeSig(name, genericContext.ValueTypeGenericParams?.Contains(name) == true);
+        return new GenericParameterTypeSig(name, genericContext.ValueTypeGenericParams?.Contains(name) == true, index, IsMethodParameter: true);
     }
 
     public TypeSig GetFunctionPointerType(MethodSignature<TypeSig> signature) => new FunctionPointerTypeSig(signature);
@@ -245,5 +248,81 @@ internal static class TypeSigRenderer
                 break;
             }
         }
+    }
+}
+
+/// <summary>
+/// Projections of a decoded <see cref="TypeSig"/> used by extraction, so each signature blob is decoded once and the
+/// display form, XML doc ID form, and by-type references are all derived from the same tree.
+/// </summary>
+internal static class TypeSigProjections
+{
+    private static readonly IReadOnlyList<(string FullName, string SimpleName)> NoRefs = Array.Empty<(string, string)>();
+
+    /// <summary>XML documentation ID form (e.g. <c>System.Collections.Generic.List{System.String}</c>, <c>``0</c>, <c>System.Int32@</c>).</summary>
+    public static string ToXmlDocName(TypeSig sig) => sig switch
+    {
+        PrimitiveTypeSig p => XmlDocSignatureProvider.Instance.GetPrimitiveType(p.Code),
+        NamedTypeSig n => n.XmlDocName,
+        GenericInstanceTypeSig g => XmlDocSignatureProvider.Instance.GetGenericInstantiation(
+            g.Definition.XmlDocName, g.Arguments.Select(ToXmlDocName).ToImmutableArray()),
+        ArrayTypeSig a => a.Rank <= 1
+            ? ToXmlDocName(a.Element) + "[]"
+            : XmlDocSignatureProvider.Instance.GetArrayType(ToXmlDocName(a.Element), new ArrayShape(a.Rank, ImmutableArray<int>.Empty, ImmutableArray<int>.Empty)),
+        ByRefTypeSig r => ToXmlDocName(r.Element) + "@",
+        PointerTypeSig ptr => ToXmlDocName(ptr.Element) + "*",
+        GenericParameterTypeSig gp => (gp.IsMethodParameter ? "``" : "`") + gp.Index,
+        FunctionPointerTypeSig => "System.IntPtr",
+        _ => string.Empty,
+    };
+
+    /// <summary>
+    /// Named types referenced anywhere in the signature as (namespace-qualified name, simple alias), for the by-type
+    /// reverse lookup table. Generic parameters and <c>void</c> contribute nothing; <c>Nullable&lt;T&gt;</c> contributes <c>T</c>.
+    /// </summary>
+    public static IReadOnlyList<(string FullName, string SimpleName)> CollectTypeRefs(TypeSig sig)
+    {
+        var list = new List<(string, string)>();
+        Collect(sig, list);
+        return list.Count == 0 ? NoRefs : list;
+    }
+
+    private static void Collect(TypeSig sig, List<(string FullName, string SimpleName)> list)
+    {
+        switch (sig)
+        {
+            case PrimitiveTypeSig p when p.Code != PrimitiveTypeCode.Void:
+                list.Add((XmlDocSignatureProvider.Instance.GetPrimitiveType(p.Code), DisplaySignatureProvider.FormatPrimitive(p.Code)));
+                break;
+            case NamedTypeSig n when !string.IsNullOrEmpty(n.FullName):
+                list.Add((n.FullName, LeafAlias(n.FullName)));
+                break;
+            case GenericInstanceTypeSig g when g.IsNullableValueType:
+                Collect(g.Arguments[0], list);
+                break;
+            case GenericInstanceTypeSig g:
+                Collect(g.Definition, list);
+                foreach (var arg in g.Arguments) Collect(arg, list);
+                break;
+            case ArrayTypeSig a:
+                Collect(a.Element, list);
+                break;
+            case ByRefTypeSig r:
+                Collect(r.Element, list);
+                break;
+            case PointerTypeSig ptr:
+                Collect(ptr.Element, list);
+                break;
+            case FunctionPointerTypeSig fp:
+                foreach (var pt in fp.Signature.ParameterTypes) Collect(pt, list);
+                Collect(fp.Signature.ReturnType, list);
+                break;
+        }
+    }
+
+    private static string LeafAlias(string fullName)
+    {
+        var idx = fullName.LastIndexOf('.');
+        return DisplaySignatureProvider.NormalizePrimitiveAlias(idx >= 0 ? fullName[(idx + 1)..] : fullName);
     }
 }

@@ -50,6 +50,8 @@ public static partial class XmlDocReader
     [GeneratedRegex(@"\s+")]
     private static partial Regex MultiSpaceRegex();
 
+    internal static readonly string[] LocaleSubdirs = { "en", "en-US", "zh-Hans", "zh-CN" };
+
     public static string? FindXmlDocPath(string assemblyPath)
     {
         var xml = Path.ChangeExtension(assemblyPath, ".xml");
@@ -59,7 +61,7 @@ public static partial class XmlDocReader
         if (string.IsNullOrEmpty(dir)) return null;
         var fileName = Path.GetFileName(xml);
 
-        foreach (var sub in new[] { "en", "en-US", "zh-Hans", "zh-CN" })
+        foreach (var sub in LocaleSubdirs)
         {
             var candidate = Path.Combine(dir, sub, fileName);
             if (File.Exists(candidate)) return candidate;

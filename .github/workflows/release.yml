@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            os: windows-latest
+            exe: apilookup.exe
+            native_lib: e_sqlite3.dll
+            archive_ext: zip
+          - rid: linux-x64
+            os: ubuntu-latest
+            exe: apilookup
+            native_lib: libe_sqlite3.so
+            archive_ext: tar.gz
+          - rid: osx-arm64
+            os: macos-latest
+            exe: apilookup
+            native_lib: libe_sqlite3.dylib
+            archive_ext: tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install Native AOT prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang zlib1g-dev
+
+      - name: Publish Native AOT binary
+        run: >
+          dotnet publish src/ApiLookup/ApiLookup.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          -p:PublishAot=true
+          -p:StripSymbols=true
+          -p:DebugType=none
+          -p:DebugSymbols=false
+          -o publish
+
+      - name: Smoke test Native AOT binary
+        shell: pwsh
+        run: |
+          $exe = "./publish/${{ matrix.exe }}"
+          $dll = "src/ApiLookup/bin/Release/net8.0/${{ matrix.rid }}/apilookup.dll"
+          $smokeDb = "./smoke.db"
+
+          $ver = & $exe --version --verbose
+          if ($LASTEXITCODE -ne 0) { throw "version check failed" }
+          $ver | ForEach-Object { Write-Host $_ }
+          $hash = (($ver | Where-Object { $_ -match '^source-hash:' }) -replace '^source-hash:\s*', '').Trim()
+          if ([string]::IsNullOrEmpty($hash) -or $hash -eq 'unknown') {
+            throw "Embedded source-hash missing from AOT binary."
+          }
+
+          & $exe index --db $smokeDb --dll $dll; if ($LASTEXITCODE -ne 0) { throw "index failed" }
+          & $exe search IndexStore --db $smokeDb --json | Out-Null; if ($LASTEXITCODE -ne 0) { throw "search failed" }
+          & $exe show IndexStore --db $smokeDb --json | Out-Null; if ($LASTEXITCODE -ne 0) { throw "show failed" }
+          & $exe hierarchy IndexStore --db $smokeDb | Out-Null; if ($LASTEXITCODE -ne 0) { throw "hierarchy failed" }
+          & $exe by-type IndexStore --db $smokeDb | Out-Null; if ($LASTEXITCODE -ne 0) { throw "by-type failed" }
+          & $exe locate IndexStore --dll $dll | Out-Null; if ($LASTEXITCODE -ne 0) { throw "locate failed" }
+
+      - name: Stage archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
+          Copy-Item "publish/${{ matrix.exe }}" "stage/"
+          if (Test-Path "publish/${{ matrix.native_lib }}") {
+            Copy-Item "publish/${{ matrix.native_lib }}" "stage/"
+          }
+          Copy-Item "LICENSE", "README.md" "stage/"
+
+          $archive = "dist/apilookup-${{ matrix.rid }}.${{ matrix.archive_ext }}"
+          if ("${{ matrix.archive_ext }}" -eq "zip") {
+            Compress-Archive -Path "stage/*" -DestinationPath $archive -Force
+          } else {
+            tar -czf $archive -C stage .
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apilookup-${{ matrix.rid }}
+          path: dist/apilookup-${{ matrix.rid }}.${{ matrix.archive_ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd release-assets
+          sha256sum apilookup-* > SHA256SUMS.txt
+          ls -la
+          cat SHA256SUMS.txt
+          gh release create "$TAG" apilookup-* SHA256SUMS.txt --title "$TAG" --generate-notes || \
+            gh release upload "$TAG" apilookup-* SHA256SUMS.txt --clobber

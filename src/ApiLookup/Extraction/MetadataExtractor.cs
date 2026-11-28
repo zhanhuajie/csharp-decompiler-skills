@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
@@ -421,7 +422,7 @@ public static class MetadataExtractor
         try
         {
             dispSig = prop.DecodeSignature(TypeSigProvider.Instance, ctx);
-            refSig = prop.DecodeSignature(TypeRefCollectorProvider.Instance, ctx);
+            refSig = Project(dispSig, TypeSigProjections.CollectTypeRefs);
         }
         catch
         {
@@ -431,8 +432,7 @@ public static class MetadataExtractor
         MethodSignature<string>? docSig = null;
         if (t.Asm.XmlDocs.Count > 0 && dispSig.ParameterTypes.Length > 0)
         {
-            try { docSig = prop.DecodeSignature(XmlDocSignatureProvider.Instance, ctx); }
-            catch { docSig = null; }
+            docSig = Project(dispSig, TypeSigProjections.ToXmlDocName);
         }
 
         var (retInfo, paramInfos) = primaryMethod.HasValue
@@ -519,7 +519,7 @@ public static class MetadataExtractor
         var primary = adder ?? remover;
         var modifiers = primary.HasValue ? GetMethodModifiers(primary.Value.Attributes, t.IsInterface) : string.Empty;
         var handlerSig = (ev.Type.IsNil ? null : TypeSigProvider.FromEntity(md, ev.Type, t.GenericCtx))
-                         ?? new NamedTypeSig("EventHandler", "System.EventHandler", IsValueType: false);
+                         ?? new NamedTypeSig("EventHandler", "System.EventHandler", IsValueType: false, XmlDocName: "System.EventHandler");
         var evNullFlags = ConstantAndAttributeReader.ReadNullableFlags(md, ev.GetCustomAttributes());
         var handlerType = TypeSigRenderer.Render(handlerSig, EffectiveFlags(evNullFlags, t.NullableContext));
         var handlerSimple = TypeNameHelper.ExtractSimpleTypeName(TypeSigRenderer.Render(handlerSig));
@@ -536,7 +536,7 @@ public static class MetadataExtractor
         typeRefs.Add(
             ev.Type.IsNil
                 ? new[] { ("System.EventHandler", "EventHandler") }
-                : TypeRefCollectorProvider.CollectFromEntity(md, ev.Type, t.GenericCtx),
+                : TypeSigProjections.CollectTypeRefs(handlerSig),
             TypeRefRoles.Return);
 
         return new ExtractedMember(
@@ -575,7 +575,7 @@ public static class MetadataExtractor
         try
         {
             fieldSig = field.DecodeSignature(TypeSigProvider.Instance, t.GenericCtx);
-            collectedRefs = field.DecodeSignature(TypeRefCollectorProvider.Instance, t.GenericCtx);
+            collectedRefs = TypeSigProjections.CollectTypeRefs(fieldSig);
         }
         catch
         {
@@ -697,7 +697,7 @@ public static class MetadataExtractor
         try
         {
             dispSig = method.DecodeSignature(TypeSigProvider.Instance, fullCtx);
-            refSig = method.DecodeSignature(TypeRefCollectorProvider.Instance, fullCtx);
+            refSig = Project(dispSig, TypeSigProjections.CollectTypeRefs);
         }
         catch
         {
@@ -713,8 +713,7 @@ public static class MetadataExtractor
         MethodSignature<string>? docSig = null;
         if (t.Asm.XmlDocs.Count > 0 || isExt)
         {
-            try { docSig = method.DecodeSignature(XmlDocSignatureProvider.Instance, fullCtx); }
-            catch { docSig = null; }
+            docSig = Project(dispSig, TypeSigProjections.ToXmlDocName);
         }
 
         var (retInfo, paramInfos) = ReadParamMetadata(md, method);
@@ -841,6 +840,11 @@ public static class MetadataExtractor
             }
         }
     }
+
+    /// <summary>Derives another signature projection from the single decoded <see cref="TypeSig"/> signature.</summary>
+    private static MethodSignature<TOut> Project<TOut>(MethodSignature<TypeSig> sig, Func<TypeSig, TOut> projection)
+        => new(sig.Header, projection(sig.ReturnType), sig.RequiredParameterCount, sig.GenericParameterCount,
+            sig.ParameterTypes.Select(projection).ToImmutableArray());
 
     /// <summary>Per-position <c>NullableAttribute</c> flags win; otherwise the enclosing nullable context applies uniformly.</summary>
     private static NullableFlags EffectiveFlags(NullableFlags? attributeFlags, byte nullableContext)
