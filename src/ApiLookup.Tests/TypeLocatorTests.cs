@@ -66,4 +66,49 @@ public class TypeLocatorTests
             Assert.Equal("public", concreteHits[0].Accessibility);
         }
     }
+
+    [Fact]
+    public void LocateCandidates_SinglePassSkipsNonManagedCountsManagedAndWarnsDirect()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "apilookup-locate-tests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            File.Copy(_fixtureDll, Path.Combine(tempDir, "SampleApi.dll"));
+            var nativeDll = Path.Combine(tempDir, "native.dll");
+            File.WriteAllText(nativeDll, "not a managed PE binary");
+
+            var discovered = SourceResolver.Discover(
+                Array.Empty<string>(),
+                new[] { tempDir },
+                Array.Empty<string>(),
+                resolveXmlDocs: false);
+            Assert.Equal(2, discovered.Candidates.Count);
+            Assert.All(discovered.Candidates, c => Assert.Null(c.XmlPath));
+
+            var scan = TypeLocator.LocateCandidates(discovered.Candidates, "SamplePipeSegment", collectRefGroups: true);
+            Assert.Equal(1, scan.ScannedAssemblies);
+            var hit = Assert.Single(scan.Hits);
+            Assert.Equal("ApiLookup.Tests.Fixtures.SamplePipeSegment", hit.FullName);
+            var refGroup = Assert.Single(scan.ReferenceGroups!);
+            Assert.Equal(1, refGroup.Count);
+            Assert.Empty(scan.DirectNonManagedWarnings);
+
+            var directNative = SourceResolver.Discover(
+                Array.Empty<string>(),
+                Array.Empty<string>(),
+                new[] { nativeDll },
+                resolveXmlDocs: false);
+            var directScan = TypeLocator.LocateCandidates(directNative.Candidates, "SamplePipeSegment");
+            Assert.Equal(0, directScan.ScannedAssemblies);
+            Assert.Contains(directScan.DirectNonManagedWarnings, w => w.Contains("Skipping non-managed binary"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch { }
+            }
+        }
+    }
 }

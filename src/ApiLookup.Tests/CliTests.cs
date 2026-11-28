@@ -5,6 +5,7 @@ using Xunit;
 
 namespace ApiLookup.Tests;
 
+[Collection(EnvironmentSensitiveCollection.Name)]
 public class CliTests : IDisposable
 {
     private readonly string _tempDir;
@@ -32,15 +33,15 @@ public class CliTests : IDisposable
     [Fact]
     public void ParseArgs_SupportsFlagsBeforeCommandLimit30AndValidation()
     {
-        var opts = Program.ParseArgs(new[] { "--json", "--limit", "30", "hierarchy", "SampleBaseEntity", "--tfm", "net8.0" });
+        var opts = CliParser.Parse(new[] { "--json", "--limit", "30", "hierarchy", "SampleBaseEntity", "--tfm", "net8.0" });
         Assert.True(opts.Json);
         Assert.Equal(30, opts.Limit);
         Assert.Equal("hierarchy", opts.Command);
         Assert.Equal(new[] { "SampleBaseEntity" }, opts.Positional);
         Assert.Equal("net8.0", opts.TargetFramework);
 
-        Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "by-type", "Wall", "--role", "invalid" }));
-        Assert.Throws<ArgumentException>(() => Program.ParseArgs(new[] { "search", "Wall", "--kind", "invalid" }));
+        Assert.Throws<ArgumentException>(() => CliParser.Parse(new[] { "by-type", "Wall", "--role", "invalid" }));
+        Assert.Throws<ArgumentException>(() => CliParser.Parse(new[] { "search", "Wall", "--kind", "invalid" }));
     }
 
     [Fact]
@@ -125,7 +126,7 @@ public class CliTests : IDisposable
             Assert.False(doc.RootElement.GetProperty("dropped").GetBoolean());
         }
 
-        // 9. locate / scan zero-cache PE scan with --list-refs --json & --include-nonpublic (consistent camelCase!)
+        // 9. locate zero-cache PE scan with --list-refs --json & --include-nonpublic, rejecting --db / --index
         var locOut = new StringWriter();
         Assert.Equal(0, Program.Run(new[] { "locate", "InternalFixtureHelper", "--dll", _fixtureDll, "--include-nonpublic", "--list-refs", "--json" }, locOut, new StringWriter()));
         using (var doc = JsonDocument.Parse(locOut.ToString()))
@@ -137,8 +138,13 @@ public class CliTests : IDisposable
             Assert.Equal("ApiLookup.Tests.Fixtures.InternalFixtureHelper", matches[0].GetProperty("fullName").GetString());
         }
 
-        var scanTextOut = new StringWriter();
-        Assert.Equal(0, Program.Run(new[] { "scan", "SamplePipeSegment", "--db", dbPath }, scanTextOut, new StringWriter()));
-        Assert.Contains("[FOUND] ApiLookup.Tests.Fixtures.SamplePipeSegment", scanTextOut.ToString());
+        var locTextOut = new StringWriter();
+        Assert.Equal(0, Program.Run(new[] { "locate", "SamplePipeSegment", "--dll", _fixtureDll }, locTextOut, new StringWriter()));
+        Assert.Contains("[FOUND] ApiLookup.Tests.Fixtures.SamplePipeSegment", locTextOut.ToString());
+
+        var locDbErr = new StringWriter();
+        Assert.Equal(1, Program.Run(new[] { "locate", "SamplePipeSegment", "--db", dbPath }, new StringWriter(), locDbErr));
+        Assert.Contains("not valid for 'locate'", locDbErr.ToString());
+        Assert.Contains("'search' or 'show'", locDbErr.ToString());
     }
 }

@@ -147,6 +147,18 @@ internal static class TypeNameHelper
         };
     }
 
+    /// <summary>Exact CLR name of the type definition behind a TypeDef/TypeRef/TypeSpec handle (see <see cref="ClrNameProvider"/>).</summary>
+    public static string ResolveEntityClrName(MetadataReader md, EntityHandle handle, GenericContext ctx)
+    {
+        return handle.Kind switch
+        {
+            HandleKind.TypeDefinition => ClrNameProvider.Instance.GetTypeFromDefinition(md, (TypeDefinitionHandle)handle, 0),
+            HandleKind.TypeReference => ClrNameProvider.Instance.GetTypeFromReference(md, (TypeReferenceHandle)handle, 0),
+            HandleKind.TypeSpecification => ClrNameProvider.Instance.GetTypeFromSpecification(md, ctx, (TypeSpecificationHandle)handle, 0),
+            _ => string.Empty,
+        };
+    }
+
     private static string StripDelimited(string text, char open, char close)
     {
         if (string.IsNullOrEmpty(text) || !text.Contains(open))
@@ -353,7 +365,7 @@ internal static class TypeNameHelper
                     var constraint = md.GetGenericParameterConstraint(ch);
                     var cFull = StripGenerics(ResolveEntityFullName(md, constraint.Type, fullCtx));
                     if (string.IsNullOrEmpty(cFull) ||
-                        cFull is "System.ValueType" or "ValueType" or "System.Object" or "object" ||
+                        cFull is WellKnownTypes.ValueType or "ValueType" or WellKnownTypes.Object or "object" ||
                         IsGenericParamName(cFull, fullCtx))
                         continue;
                     var cSimple = ExtractSimpleTypeName(cFull);
@@ -362,8 +374,8 @@ internal static class TypeNameHelper
                 }
 
                 // Preserve `where T : struct` when combined with concrete constraints (e.g. `where T : struct, ISampleItem`).
-                if (isValueTypeConstraint && targets.Count > 0 && seen.Add("System.ValueType"))
-                    targets.Add(new ExtensionTargetRef("System.ValueType", "ValueType"));
+                if (isValueTypeConstraint && targets.Count > 0 && seen.Add(WellKnownTypes.ValueType))
+                    targets.Add(new ExtensionTargetRef(WellKnownTypes.ValueType, "ValueType"));
             }
             return targets;
         }

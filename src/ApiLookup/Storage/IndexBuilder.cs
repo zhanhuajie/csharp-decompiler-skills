@@ -7,8 +7,37 @@ namespace ApiLookup;
 
 public static class IndexBuilder
 {
-    public const string SchemaVersion = "4";
+    /// <summary>
+    /// Identity of the extractor that produced an index. Part of every fingerprint, so upgrading the tool (which may
+    /// change signatures, docs, or tokens without a schema change) rebuilds cached indexes automatically.
+    /// </summary>
+    private static readonly string ToolIdentity =
+        BuildInfo.GetSourceHash() ?? typeof(IndexBuilder).Assembly.GetName().Version?.ToString() ?? "dev";
 
+    private static string EffectiveFingerprint(bool includeNonPublic, string fingerprint)
+        => $"{IndexSchema.Version}|{ToolIdentity}|{(includeNonPublic ? "all" : "pub")}|{fingerprint}";
+
+    /// <summary>
+    /// Fast path that avoids opening any assembly: reuses the index when its recorded stat fingerprint (paths, sizes,
+    /// mtimes and XML companions of every discovered candidate) still matches.
+    /// </summary>
+    public static bool TryOpenFresh(
+        string dbPath,
+        string? indexName,
+        DiscoveredSources discovered,
+        bool includeNonPublic,
+        out (IndexStore Store, IndexStats Stats) result)
+    {
+        result = default;
+        if (discovered.Candidates.Count == 0) return false;
+
+        var sw = Stopwatch.StartNew();
+        if (!TryOpenMatching(dbPath, "stat_fingerprint", EffectiveFingerprint(includeNonPublic, discovered.StatFingerprint), out var store))
+            return false;
+
+        result = (store!, store!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds));
+        return true;
+    }
     public static (IndexStore Store, IndexStats Stats) EnsureBuilt(
         string dbPath,
         string? indexName,
@@ -16,17 +45,22 @@ public static class IndexBuilder
         string sourceDescription,
         bool includeNonPublic,
         bool forceRebuild,
-        List<string>? warnings = null)
+        List<string>? warnings = null,
+        Action<string>? diagnostics = null)
     {
         var sw = Stopwatch.StartNew();
         var dir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
 
-        var effectiveFingerprint = $"{SchemaVersion}|{(includeNonPublic ? "all" : "pub")}|{sources.Fingerprint}";
+        var effectiveFingerprint = EffectiveFingerprint(includeNonPublic, sources.Fingerprint);
+        var effectiveStatFingerprint = sources.StatFingerprint != null ? EffectiveFingerprint(includeNonPublic, sources.StatFingerprint) : null;
 
-        if (!forceRebuild && TryOpenMatching(dbPath, effectiveFingerprint, out var fastStore))
+        if (!forceRebuild && TryOpenMatching(dbPath, "fingerprint", effectiveFingerprint, out var fastStore))
         {
+            // Content unchanged but file metadata moved (e.g. a non-managed DLL was touched): refresh the stat fingerprint
+            // so the next query takes the no-probe fast path again.
+            RefreshStatFingerprint(fastStore!, effectiveStatFingerprint);
             var stats = fastStore!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds);
             return (fastStore, stats);
         }
@@ -34,18 +68,21 @@ public static class IndexBuilder
         using var buildLock = IndexCatalog.AcquireBuildLock(dbPath);
 
         // Re-check after acquiring the cross-process lock in case another process just completed the build.
-        if (!forceRebuild && TryOpenMatching(dbPath, effectiveFingerprint, out var lockedFastStore))
+        if (!forceRebuild && TryOpenMatching(dbPath, "fingerprint", effectiveFingerprint, out var lockedFastStore))
         {
+            RefreshStatFingerprint(lockedFastStore!, effectiveStatFingerprint);
             var stats = lockedFastStore!.ReadStats(indexName, rebuilt: false, sw.ElapsedMilliseconds);
             return (lockedFastStore, stats);
         }
 
-        var tempPath = dbPath + $".tmp-{Environment.ProcessId}-{Guid.NewGuid():N}";
+        var tempPath = IndexCatalog.CreateTempBuildPath(dbPath);
+        using var producerCts = new CancellationTokenSource();
+        Task? producerTask = null;
         try
         {
             if (File.Exists(tempPath)) File.Delete(tempPath);
 
-            var channel = Channel.CreateBounded<ExtractedAssembly>(new BoundedChannelOptions(Math.Max(4, Environment.ProcessorCount * 2))
+            var channel = Channel.CreateBounded<PreparedAssembly>(new BoundedChannelOptions(Math.Max(4, Environment.ProcessorCount * 2))
             {
                 SingleWriter = false,
                 SingleReader = true,
@@ -53,18 +90,22 @@ public static class IndexBuilder
             });
 
             var extractWarnings = new ConcurrentBag<string>();
-            var producerTask = Task.Run(async () =>
+            long extractTicks = 0;
+            var parallelOptions = new ParallelOptions { CancellationToken = producerCts.Token };
+            producerTask = Task.Run(async () =>
             {
                 try
                 {
-                    await Parallel.ForEachAsync(sources.Assemblies, async (asm, ct) =>
+                    await Parallel.ForEachAsync(sources.Assemblies, parallelOptions, async (asm, ct) =>
                     {
                         var localWarnings = new List<string>();
+                        var extractStart = Stopwatch.GetTimestamp();
                         var extracted = MetadataExtractor.Extract(asm, includeNonPublic, localWarnings);
+                        Interlocked.Add(ref extractTicks, Stopwatch.GetTimestamp() - extractStart);
                         foreach (var w in localWarnings)
                             extractWarnings.Add(w);
                         if (extracted != null)
-                            await channel.Writer.WriteAsync(extracted, ct).ConfigureAwait(false);
+                            await channel.Writer.WriteAsync(PreparedAssembly.Create(extracted), ct).ConfigureAwait(false);
                     }).ConfigureAwait(false);
                     channel.Writer.Complete();
                 }
@@ -85,24 +126,42 @@ PRAGMA cache_size = -64000;
 ");
                 CreateTables(conn);
 
+                var phase = Stopwatch.StartNew();
                 using (var tx = conn.BeginTransaction())
                 {
-                    InsertFromChannel(conn, tx, channel.Reader, indexName, effectiveFingerprint, sourceDescription);
+                    var insertTicks = InsertFromChannel(conn, tx, channel.Reader, indexName, effectiveFingerprint, effectiveStatFingerprint, sourceDescription);
                     producerTask.GetAwaiter().GetResult();
                     tx.Commit();
+                    diagnostics?.Invoke($"extract+insert {phase.ElapsedMilliseconds} ms wall (extraction {Stopwatch.GetElapsedTime(0, extractTicks).TotalMilliseconds:F0} ms CPU across workers, inserts {Stopwatch.GetElapsedTime(0, insertTicks).TotalMilliseconds:F0} ms)");
                 }
 
+                phase.Restart();
                 CreateIndexes(conn);
+                diagnostics?.Invoke($"secondary indexes {phase.ElapsedMilliseconds} ms");
+
+                phase.Restart();
+                InheritDocResolver.Resolve(conn);
+                diagnostics?.Invoke($"inheritdoc resolution {phase.ElapsedMilliseconds} ms");
+
+                phase.Restart();
                 ExecuteNonQuery(conn, @"
 INSERT INTO fts_entries(fts_entries) VALUES('optimize');
 ANALYZE;
 ");
+                diagnostics?.Invoke($"fts optimize + analyze {phase.ElapsedMilliseconds} ms");
             }
 
             foreach (var w in extractWarnings)
                 warnings?.Add(w);
 
-            File.Move(tempPath, dbPath, overwrite: true);
+            ReplaceFileWithRetry(tempPath, dbPath);
+        }
+        catch
+        {
+            // Unblock producers waiting on the bounded channel so they don't leak when the writer fails.
+            producerCts.Cancel();
+            try { producerTask?.Wait(TimeSpan.FromSeconds(5)); } catch { }
+            throw;
         }
         finally
         {
@@ -117,166 +176,93 @@ ANALYZE;
         return (store, builtStats);
     }
 
-    private static bool TryOpenMatching(string dbPath, string expectedFingerprint, out IndexStore? store)
+    /// <summary>
+    /// Atomically replaces <paramref name="destPath"/>, retrying briefly when another process
+    /// (e.g. a concurrent read-only query on Windows) still holds the old database open.
+    /// </summary>
+    private static void ReplaceFileWithRetry(string sourcePath, string destPath)
+    {
+        const int maxAttempts = 20;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                File.Move(sourcePath, destPath, overwrite: true);
+                return;
+            }
+            catch (Exception ex) when (attempt < maxAttempts && ex is IOException or UnauthorizedAccessException)
+            {
+                Thread.Sleep(100);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new IOException(
+                    $"Could not replace index database '{destPath}' because it is locked by another process. " +
+                    "Close other apilookup queries using this index and retry.", ex);
+            }
+        }
+    }
+
+    private static bool TryOpenMatching(string dbPath, string metaKey, string expectedFingerprint, out IndexStore? store)
     {
         store = null;
         if (!File.Exists(dbPath)) return false;
 
+        IndexStore? candidate = null;
         try
         {
-            var candidate = IndexStore.OpenReadOnly(dbPath);
-            if (candidate.GetMeta("fingerprint") == expectedFingerprint &&
-                candidate.GetMeta("schema_version") == SchemaVersion)
+            candidate = IndexStore.OpenReadOnly(dbPath);
+            if (candidate.GetMeta(metaKey) == expectedFingerprint &&
+                candidate.GetMeta("schema_version") == IndexSchema.Version)
             {
                 store = candidate;
+                candidate = null; // ownership transferred to caller
                 return true;
             }
-            candidate.Dispose();
         }
         catch
         {
-            store?.Dispose();
-            store = null;
+            // Corrupt, foreign, or legacy (pre-meta) database: treat as stale and rebuild.
+        }
+        finally
+        {
+            // Always release the handle so the rebuilt temp DB can atomically replace dbPath (Windows sharing rules).
+            candidate?.Dispose();
         }
         return false;
     }
 
-    private static void CreateTables(SqliteConnection conn)
+    private static void RefreshStatFingerprint(IndexStore store, string? effectiveStatFingerprint)
     {
-        ExecuteNonQuery(conn, @"
-CREATE TABLE meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE assemblies (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL COLLATE NOCASE,
-    path TEXT NOT NULL,
-    version TEXT NOT NULL,
-    xml_path TEXT,
-    file_size INTEGER NOT NULL,
-    mtime_utc INTEGER NOT NULL,
-    type_count INTEGER NOT NULL
-);
-
-CREATE TABLE types (
-    id INTEGER PRIMARY KEY,
-    assembly_id INTEGER NOT NULL,
-    full_name TEXT NOT NULL COLLATE NOCASE,
-    bare_full_name TEXT NOT NULL COLLATE NOCASE,
-    clr_name TEXT NOT NULL COLLATE NOCASE,
-    namespace TEXT NOT NULL COLLATE NOCASE,
-    name TEXT NOT NULL COLLATE NOCASE,
-    simple_name TEXT NOT NULL COLLATE NOCASE,
-    kind TEXT NOT NULL COLLATE NOCASE,
-    accessibility TEXT NOT NULL,
-    modifiers TEXT NOT NULL,
-    base_type TEXT COLLATE NOCASE,
-    base_bare TEXT COLLATE NOCASE,
-    base_simple TEXT COLLATE NOCASE,
-    interfaces TEXT NOT NULL,
-    generic_params TEXT NOT NULL,
-    generic_constraints TEXT NOT NULL,
-    delegate_signature TEXT,
-    is_extension_container INTEGER NOT NULL,
-    summary TEXT,
-    remarks TEXT,
-    doc_id TEXT NOT NULL
-);
-
-CREATE TABLE type_interfaces (
-    type_id INTEGER NOT NULL,
-    iface_full TEXT NOT NULL COLLATE NOCASE,
-    iface_simple TEXT NOT NULL COLLATE NOCASE
-);
-
-CREATE TABLE members (
-    id INTEGER PRIMARY KEY,
-    type_id INTEGER NOT NULL,
-    assembly_id INTEGER NOT NULL,
-    kind TEXT NOT NULL COLLATE NOCASE,
-    name TEXT NOT NULL COLLATE NOCASE,
-    accessibility TEXT NOT NULL,
-    modifiers TEXT NOT NULL,
-    return_type TEXT NOT NULL,
-    return_simple TEXT NOT NULL COLLATE NOCASE,
-    signature TEXT NOT NULL,
-    param_types TEXT NOT NULL,
-    ext_target_type TEXT COLLATE NOCASE,
-    ext_target_simple TEXT COLLATE NOCASE,
-    enum_value TEXT,
-    summary TEXT,
-    params_doc TEXT,
-    returns_doc TEXT,
-    doc_id TEXT NOT NULL
-);
-
-CREATE TABLE extension_targets (
-    member_id INTEGER NOT NULL,
-    target_full TEXT NOT NULL COLLATE NOCASE,
-    target_simple TEXT NOT NULL COLLATE NOCASE
-);
-
-CREATE TABLE member_type_refs (
-    member_id INTEGER NOT NULL,
-    type_full TEXT NOT NULL COLLATE NOCASE,
-    type_simple TEXT NOT NULL COLLATE NOCASE,
-    role TEXT NOT NULL
-);
-
-CREATE VIRTUAL TABLE fts_entries USING fts5(
-    entity_type UNINDEXED,
-    entity_id UNINDEXED,
-    kind UNINDEXED,
-    assembly_name UNINDEXED,
-    namespace UNINDEXED,
-    full_name,
-    name,
-    tokens,
-    summary,
-    tokenize = 'unicode61'
-);
-");
+        if (effectiveStatFingerprint == null || store.GetMeta("stat_fingerprint") == effectiveStatFingerprint)
+            return;
+        try
+        {
+            using var conn = new SqliteConnection($"Data Source={store.DbPath};Mode=ReadWrite;Pooling=False");
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO meta(key, value) VALUES('stat_fingerprint', $v)";
+            cmd.Parameters.AddWithValue("$v", effectiveStatFingerprint);
+            cmd.ExecuteNonQuery();
+        }
+        catch
+        {
+            // Best effort: a read-only or locked database just keeps using the slower probe path.
+        }
     }
 
-    private static void CreateIndexes(SqliteConnection conn)
-    {
-        ExecuteNonQuery(conn, @"
-CREATE INDEX idx_types_full_name ON types(full_name);
-CREATE INDEX idx_types_bare_full_name ON types(bare_full_name);
-CREATE INDEX idx_types_clr_name ON types(clr_name);
-CREATE INDEX idx_types_simple_name ON types(simple_name);
-CREATE INDEX idx_types_name ON types(name);
-CREATE INDEX idx_types_base_type ON types(base_type);
-CREATE INDEX idx_types_base_bare ON types(base_bare);
-CREATE INDEX idx_types_base_simple ON types(base_simple);
-CREATE INDEX idx_types_namespace ON types(namespace);
-CREATE INDEX idx_types_assembly_id ON types(assembly_id);
+    private static void CreateTables(SqliteConnection conn) => ExecuteNonQuery(conn, IndexSchema.CreateTablesSql);
 
-CREATE INDEX idx_type_interfaces_type_id ON type_interfaces(type_id);
-CREATE INDEX idx_type_interfaces_full ON type_interfaces(iface_full);
-CREATE INDEX idx_type_interfaces_simple ON type_interfaces(iface_simple);
+    private static void CreateIndexes(SqliteConnection conn) => ExecuteNonQuery(conn, IndexSchema.CreateIndexesSql);
 
-CREATE INDEX idx_members_type_id ON members(type_id);
-CREATE INDEX idx_members_name ON members(name);
-CREATE INDEX idx_members_ext_target ON members(ext_target_type);
-CREATE INDEX idx_members_ext_simple ON members(ext_target_simple);
-
-CREATE INDEX idx_extension_targets_lookup ON extension_targets(target_simple, target_full, member_id);
-CREATE INDEX idx_extension_targets_member ON extension_targets(member_id);
-
-CREATE INDEX idx_member_type_refs_lookup ON member_type_refs(type_simple, role, member_id);
-CREATE INDEX idx_member_type_refs_full ON member_type_refs(type_full, role, member_id);
-");
-    }
-
-    private static void InsertFromChannel(
+    /// <returns>Stopwatch ticks spent writing rows (excluding time waiting for extraction).</returns>
+    private static long InsertFromChannel(
         SqliteConnection conn,
         SqliteTransaction tx,
-        ChannelReader<ExtractedAssembly> reader,
+        ChannelReader<PreparedAssembly> reader,
         string? indexName,
         string fingerprint,
+        string? statFingerprint,
         string sourceDescription)
     {
         using var metaCmd = conn.CreateCommand();
@@ -292,8 +278,10 @@ CREATE INDEX idx_member_type_refs_full ON member_type_refs(type_full, role, memb
             metaCmd.ExecuteNonQuery();
         }
 
-        PutMeta("schema_version", SchemaVersion);
+        PutMeta("schema_version", IndexSchema.Version);
         PutMeta("fingerprint", fingerprint);
+        if (statFingerprint != null)
+            PutMeta("stat_fingerprint", statFingerprint);
         PutMeta("built_at_utc", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
         PutMeta("sources", sourceDescription);
         if (!string.IsNullOrWhiteSpace(indexName))
@@ -317,11 +305,11 @@ VALUES($id, $name, $path, $version, $xml, $size, $mtime, $tcount);";
         typeCmd.Transaction = tx;
         typeCmd.CommandText = @"
 INSERT INTO types(id, assembly_id, full_name, bare_full_name, clr_name, namespace, name, simple_name, kind,
-                  accessibility, modifiers, base_type, base_bare, base_simple, interfaces, generic_params,
-                  generic_constraints, delegate_signature, is_extension_container, summary, remarks, doc_id)
+                  accessibility, modifiers, base_type, base_bare, base_simple, base_clr, interfaces, generic_params,
+                  generic_constraints, delegate_signature, is_extension_container, summary, remarks, doc_id, inheritdoc)
 VALUES($id, $aid, $full, $bareFull, $clr, $ns, $name, $simple, $kind,
-       $acc, $mod, $base, $baseBare, $baseSimple, $ifaces, $gp,
-       $gcon, $dsig, $ext, $sum, $rem, $docId);";
+       $acc, $mod, $base, $baseBare, $baseSimple, $baseClr, $ifaces, $gp,
+       $gcon, $dsig, $ext, $sum, $rem, $docId, $inh);";
         var pTId = typeCmd.Parameters.Add("$id", SqliteType.Integer);
         var pTAid = typeCmd.Parameters.Add("$aid", SqliteType.Integer);
         var pTFull = typeCmd.Parameters.Add("$full", SqliteType.Text);
@@ -344,21 +332,24 @@ VALUES($id, $aid, $full, $bareFull, $clr, $ns, $name, $simple, $kind,
         var pTSum = typeCmd.Parameters.Add("$sum", SqliteType.Text);
         var pTRem = typeCmd.Parameters.Add("$rem", SqliteType.Text);
         var pTDocId = typeCmd.Parameters.Add("$docId", SqliteType.Text);
+        var pTBaseClr = typeCmd.Parameters.Add("$baseClr", SqliteType.Text);
+        var pTInh = typeCmd.Parameters.Add("$inh", SqliteType.Text);
 
         using var ifaceCmd = conn.CreateCommand();
         ifaceCmd.Transaction = tx;
-        ifaceCmd.CommandText = "INSERT INTO type_interfaces(type_id, iface_full, iface_simple) VALUES($tid, $full, $simple);";
+        ifaceCmd.CommandText = "INSERT INTO type_interfaces(type_id, iface_full, iface_simple, iface_clr) VALUES($tid, $full, $simple, $clr);";
         var pITid = ifaceCmd.Parameters.Add("$tid", SqliteType.Integer);
         var pIFull = ifaceCmd.Parameters.Add("$full", SqliteType.Text);
         var pISimple = ifaceCmd.Parameters.Add("$simple", SqliteType.Text);
+        var pIClr = ifaceCmd.Parameters.Add("$clr", SqliteType.Text);
 
         using var memCmd = conn.CreateCommand();
         memCmd.Transaction = tx;
         memCmd.CommandText = @"
 INSERT INTO members(id, type_id, assembly_id, kind, name, accessibility, modifiers, return_type, return_simple,
-                    signature, param_types, ext_target_type, ext_target_simple, enum_value, summary, params_doc, returns_doc, doc_id)
+                    signature, param_types, ext_target_type, ext_target_simple, enum_value, summary, params_doc, returns_doc, doc_id, inheritdoc)
 VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
-       $sig, $ptypes, $extT, $extS, $eval, $sum, $pdoc, $rdoc, $docId);";
+       $sig, $ptypes, $extT, $extS, $eval, $sum, $pdoc, $rdoc, $docId, $inh);";
         var pMId = memCmd.Parameters.Add("$id", SqliteType.Integer);
         var pMTid = memCmd.Parameters.Add("$tid", SqliteType.Integer);
         var pMAid = memCmd.Parameters.Add("$aid", SqliteType.Integer);
@@ -377,6 +368,7 @@ VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
         var pMPdoc = memCmd.Parameters.Add("$pdoc", SqliteType.Text);
         var pMRdoc = memCmd.Parameters.Add("$rdoc", SqliteType.Text);
         var pMDocId = memCmd.Parameters.Add("$docId", SqliteType.Text);
+        var pMInh = memCmd.Parameters.Add("$inh", SqliteType.Text);
 
         using var extTargetCmd = conn.CreateCommand();
         extTargetCmd.Transaction = tx;
@@ -396,8 +388,9 @@ VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
         using var ftsCmd = conn.CreateCommand();
         ftsCmd.Transaction = tx;
         ftsCmd.CommandText = @"
-INSERT INTO fts_entries(entity_type, entity_id, kind, assembly_name, namespace, full_name, name, tokens, summary)
-VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
+INSERT INTO fts_entries(rowid, entity_type, entity_id, kind, assembly_name, namespace, full_name, name, tokens, summary)
+VALUES($rowid, $et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
+        var pFRowId = ftsCmd.Parameters.Add("$rowid", SqliteType.Integer);
         var pFEt = ftsCmd.Parameters.Add("$et", SqliteType.Text);
         var pFEid = ftsCmd.Parameters.Add("$eid", SqliteType.Integer);
         var pFKind = ftsCmd.Parameters.Add("$kind", SqliteType.Text);
@@ -412,10 +405,13 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
         long nextTypeId = 0;
         long nextMemId = 0;
 
+        long insertTicks = 0;
         while (reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
         {
-            while (reader.TryRead(out var asm))
+            while (reader.TryRead(out var prepared))
             {
+                var asmStart = Stopwatch.GetTimestamp();
+                var asm = prepared.Assembly;
                 var asmId = ++nextAsmId;
                 pAsmId.Value = asmId;
                 pAsmName.Value = asm.Name;
@@ -427,8 +423,9 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                 pAsmTCount.Value = asm.Types.Count;
                 asmCmd.ExecuteNonQuery();
 
-                foreach (var t in asm.Types)
+                for (var ti = 0; ti < asm.Types.Count; ti++)
                 {
+                    var t = asm.Types[ti];
                     var typeId = ++nextTypeId;
                     pTId.Value = typeId;
                     pTAid.Value = asmId;
@@ -452,6 +449,8 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                     pTSum.Value = (object?)t.Summary ?? DBNull.Value;
                     pTRem.Value = (object?)t.Remarks ?? DBNull.Value;
                     pTDocId.Value = t.DocId;
+                    pTBaseClr.Value = (object?)t.BaseClr ?? DBNull.Value;
+                    pTInh.Value = (object?)t.InheritDoc ?? DBNull.Value;
                     typeCmd.ExecuteNonQuery();
 
                     foreach (var iface in t.InterfaceRefs)
@@ -459,27 +458,25 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         pITid.Value = typeId;
                         pIFull.Value = iface.FullName;
                         pISimple.Value = iface.SimpleName;
+                        pIClr.Value = iface.ClrName;
                         ifaceCmd.ExecuteNonQuery();
                     }
 
-                    var tTokens = Tokenizer.BuildSearchTokens(t.SimpleName, t.FullName, t.BaseSimple, t.Interfaces);
-                    var tCjk = Tokenizer.BuildCjkSummaryTokens(t.Summary);
-                    if (tCjk.Length > 0)
-                        tTokens = string.IsNullOrEmpty(tTokens) ? tCjk : $"{tTokens} {tCjk}";
-
-                    pFEt.Value = "type";
+                    pFRowId.Value = IndexSchema.FtsRowIdForType(typeId);
+                    pFEt.Value = EntityTypes.Type;
                     pFEid.Value = typeId;
                     pFKind.Value = t.Kind;
                     pFAname.Value = asm.Name;
                     pFNs.Value = t.Namespace;
                     pFFull.Value = t.FullName;
                     pFName.Value = t.SimpleName;
-                    pFTokens.Value = tTokens;
+                    pFTokens.Value = prepared.TypeTokens[ti];
                     pFSum.Value = t.Summary ?? string.Empty;
                     ftsCmd.ExecuteNonQuery();
 
-                    foreach (var m in t.Members)
+                    for (var mi = 0; mi < t.Members.Count; mi++)
                     {
+                        var m = t.Members[mi];
                         var memId = ++nextMemId;
                         pMId.Value = memId;
                         pMTid.Value = typeId;
@@ -499,6 +496,7 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         pMPdoc.Value = (object?)m.ParamsDoc ?? DBNull.Value;
                         pMRdoc.Value = (object?)m.ReturnsDoc ?? DBNull.Value;
                         pMDocId.Value = m.DocId;
+                        pMInh.Value = (object?)m.InheritDoc ?? DBNull.Value;
                         memCmd.ExecuteNonQuery();
 
                         foreach (var et in m.ExtensionTargets)
@@ -519,28 +517,67 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         }
 
                         // Skip indexing trivial parameterless constructors in FTS5 (already covered by the type entry)
-                        if (m.Kind == "ctor" && string.IsNullOrEmpty(m.ParamTypes))
+                        if (m.Kind == MemberKinds.Constructor && string.IsNullOrEmpty(m.ParamTypes))
                             continue;
 
-                        var mTokens = Tokenizer.BuildSearchTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes);
-                        var mCjk = Tokenizer.BuildCjkSummaryTokens(m.Summary);
-                        if (mCjk.Length > 0)
-                            mTokens = string.IsNullOrEmpty(mTokens) ? mCjk : $"{mTokens} {mCjk}";
-
-                        pFEt.Value = "member";
+                        pFRowId.Value = IndexSchema.FtsRowIdForMember(memId);
+                        pFEt.Value = EntityTypes.Member;
                         pFEid.Value = memId;
                         pFKind.Value = m.Kind;
                         pFAname.Value = asm.Name;
                         pFNs.Value = t.Namespace;
                         pFFull.Value = $"{t.FullName}.{m.Name}";
                         pFName.Value = m.Name;
-                        pFTokens.Value = mTokens;
+                        pFTokens.Value = prepared.MemberTokens[ti][mi];
                         pFSum.Value = m.Summary ?? string.Empty;
                         ftsCmd.ExecuteNonQuery();
                     }
                 }
+                insertTicks += Stopwatch.GetTimestamp() - asmStart;
             }
         }
+        return insertTicks;
+    }
+
+    /// <summary>
+    /// An extracted assembly plus its precomputed FTS token strings. Tokenization (regex + CamelCase/CJK expansion) runs
+    /// on the parallel extraction workers so the single SQLite writer thread only binds parameters and inserts rows.
+    /// </summary>
+    private sealed record PreparedAssembly(ExtractedAssembly Assembly, string[] TypeTokens, string[][] MemberTokens)
+    {
+        public static PreparedAssembly Create(ExtractedAssembly asm)
+        {
+            var typeTokens = new string[asm.Types.Count];
+            var memberTokens = new string[asm.Types.Count][];
+            for (var i = 0; i < asm.Types.Count; i++)
+            {
+                var t = asm.Types[i];
+                typeTokens[i] = BuildTypeTokens(t.SimpleName, t.FullName, t.BaseSimple, t.Interfaces, t.Summary);
+                var tokens = new string[t.Members.Count];
+                for (var j = 0; j < t.Members.Count; j++)
+                {
+                    var m = t.Members[j];
+                    tokens[j] = BuildMemberTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes, m.Summary);
+                }
+                memberTokens[i] = tokens;
+            }
+            return new PreparedAssembly(asm, typeTokens, memberTokens);
+        }
+    }
+
+    /// <summary>FTS <c>tokens</c> column for a type: CamelCase-expanded names plus CJK n-grams of the summary.</summary>
+    internal static string BuildTypeTokens(string simpleName, string fullName, string? baseSimple, string interfaces, string? summary)
+        => AppendCjkTokens(Tokenizer.BuildSearchTokens(simpleName, fullName, baseSimple, interfaces), summary);
+
+    /// <summary>FTS <c>tokens</c> column for a member.</summary>
+    internal static string BuildMemberTokens(string name, string declaringSimpleName, string returnSimple, string paramTypes, string? summary)
+        => AppendCjkTokens(Tokenizer.BuildSearchTokens(name, declaringSimpleName, returnSimple, paramTypes), summary);
+
+    private static string AppendCjkTokens(string tokens, string? summary)
+    {
+        var cjk = Tokenizer.BuildCjkSummaryTokens(summary);
+        if (cjk.Length == 0) return tokens;
+        return string.IsNullOrEmpty(tokens) ? cjk : $"{tokens} {cjk}";
     }
 
     private static void ExecuteNonQuery(SqliteConnection conn, string sql)

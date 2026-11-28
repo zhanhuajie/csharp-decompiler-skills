@@ -5,8 +5,9 @@
     <AssemblyName>apilookup</AssemblyName>
     <PackageId>ApiLookup</PackageId>
     <RootNamespace>ApiLookup</RootNamespace>
-    <PackAsTool Condition="'$(PublishSingleFile)' != 'true'">true</PackAsTool>
+    <PackAsTool Condition="'$(PublishSingleFile)' != 'true' And '$(PublishAot)' != 'true'">true</PackAsTool>
     <ToolCommandName>apilookup</ToolCommandName>
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,5 +17,69 @@
   <ItemGroup>
     <InternalsVisibleTo Include="ApiLookup.Tests" />
   </ItemGroup>
+
+  <!--
+    Embed a line-ending-normalized SHA-256 of the tool's sources as [AssemblyMetadata("SourceHash", ...)].
+    Running apilookup with the version and verbose flags prints it, and CI compares the committed prebuilt binary against a fresh
+    build so a stale dotnet-api-lookup/scripts/apilookup.exe is caught even without a version bump.
+  -->
+  <UsingTask TaskName="ComputeApiLookupSourceHash"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Files ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+      <BaseDirectory ParameterType="System.String" Required="true" />
+      <Hash ParameterType="System.String" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Linq" />
+      <Using Namespace="System.Security.Cryptography" />
+      <Using Namespace="System.Text" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var baseDir = Path.GetFullPath(BaseDirectory).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+        var entries = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (var item in Files)
+        {
+            var full = Path.GetFullPath(item.ItemSpec);
+            var rel = full.StartsWith(baseDir, StringComparison.OrdinalIgnoreCase) ? full.Substring(baseDir.Length) : Path.GetFileName(full);
+            entries[rel.Replace('\\', '/')] = full;
+        }
+
+        var sb = new StringBuilder();
+        foreach (var kv in entries)
+        {
+            var text = File.ReadAllText(kv.Value).Replace("\r\n", "\n").Replace("\r", "\n").TrimStart('\uFEFF');
+            sb.Append(kv.Key).Append('\n').Append(text).Append('\0');
+        }
+
+        using (var sha = SHA256.Create())
+        {
+            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(sb.ToString()));
+            Hash = string.Concat(bytes.Take(8).Select(b => b.ToString("x2")));
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="EmbedApiLookupSourceHash" BeforeTargets="GetAssemblyAttributes">
+    <ItemGroup>
+      <_ApiLookupHashInput Include="$(MSBuildProjectDirectory)\**\*.cs"
+                           Exclude="$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**" />
+      <_ApiLookupHashInput Include="$(MSBuildProjectFullPath)" />
+      <_ApiLookupHashInput Include="$(DirectoryBuildPropsPath)" Condition="'$(DirectoryBuildPropsPath)' != '' And Exists('$(DirectoryBuildPropsPath)')" />
+    </ItemGroup>
+    <ComputeApiLookupSourceHash Files="@(_ApiLookupHashInput)" BaseDirectory="$(MSBuildProjectDirectory)\..\..">
+      <Output TaskParameter="Hash" PropertyName="ApiLookupSourceHash" />
+    </ComputeApiLookupSourceHash>
+    <ItemGroup>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>SourceHash</_Parameter1>
+        <_Parameter2>$(ApiLookupSourceHash)</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
 
 </Project>

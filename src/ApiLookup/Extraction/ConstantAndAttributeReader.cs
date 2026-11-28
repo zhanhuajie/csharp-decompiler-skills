@@ -60,50 +60,6 @@ internal sealed class EnumLookup
     }
 }
 
-internal sealed class ReferenceTypeLookup
-{
-    private static readonly HashSet<string> WellKnownRefTypes = new(StringComparer.Ordinal)
-    {
-        "string", "String", "System.String",
-        "object", "Object", "System.Object",
-        "Exception", "System.Exception",
-        "Type", "System.Type",
-        "Uri", "System.Uri",
-        "Task", "System.Threading.Tasks.Task",
-        "EventHandler", "System.EventHandler",
-        "Delegate", "System.Delegate",
-        "MulticastDelegate", "System.MulticastDelegate",
-        "Attribute", "System.Attribute",
-        "Stream", "System.IO.Stream",
-    };
-
-    private readonly HashSet<string> _refNames = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _valueNames = new(StringComparer.Ordinal);
-
-    public void RegisterType(string bareFullName, string simpleName, bool isValueType)
-    {
-        if (isValueType)
-        {
-            _valueNames.Add(bareFullName);
-            _valueNames.Add(simpleName);
-        }
-        else
-        {
-            _refNames.Add(bareFullName);
-            _refNames.Add(simpleName);
-        }
-    }
-
-    public bool IsConfirmedReferenceType(string cleanDisplayType)
-    {
-        if (string.IsNullOrEmpty(cleanDisplayType)) return false;
-        if (cleanDisplayType.EndsWith(']')) return true; // All CLR arrays are reference types
-        if (WellKnownRefTypes.Contains(cleanDisplayType)) return true;
-        if (_valueNames.Contains(cleanDisplayType)) return false;
-        return _refNames.Contains(cleanDisplayType);
-    }
-}
-
 internal static class ConstantAndAttributeReader
 {
     private static readonly HashSet<string> NonEnumKeywords = new(StringComparer.OrdinalIgnoreCase)
@@ -127,10 +83,9 @@ internal static class ConstantAndAttributeReader
         "nuint", "uintptr", "System.UIntPtr",
     };
 
-    public static (EnumLookup Enums, ReferenceTypeLookup RefTypes) ScanAssemblyTypes(MetadataReader md, bool includeNonPublic)
+    public static EnumLookup ScanAssemblyTypes(MetadataReader md, bool includeNonPublic)
     {
         var enums = new EnumLookup();
-        var refTypes = new ReferenceTypeLookup();
 
         foreach (var handle in md.TypeDefinitions)
         {
@@ -139,15 +94,12 @@ internal static class ConstantAndAttributeReader
             if (MetadataExtractor.ShouldSkipType(md, td, rawName, includeNonPublic))
                 continue;
 
-            var (_, _, _, bareFull, _, simpleName) = TypeNameHelper.BuildTypeNames(md, td);
             var isInterface = (td.Attributes & TypeAttributes.Interface) != 0;
             var baseFull = td.BaseType.IsNil ? null : TypeNameHelper.ResolveEntityFullName(md, td.BaseType, GenericContext.Empty);
-            var isEnum = !isInterface && baseFull == "System.Enum";
-            var isStruct = !isInterface && baseFull == "System.ValueType";
-
-            refTypes.RegisterType(bareFull, simpleName, isValueType: isEnum || isStruct);
-
+            var isEnum = !isInterface && baseFull == WellKnownTypes.Enum;
             if (!isEnum) continue;
+
+            var (_, _, _, bareFull, _, simpleName) = TypeNameHelper.BuildTypeNames(md, td);
 
             var isFlags = HasAttribute(md, td.GetCustomAttributes(), "System", "FlagsAttribute");
             var map = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -172,7 +124,7 @@ internal static class ConstantAndAttributeReader
             enums.Register(bareFull, simpleName, map, flagMembers, isFlags);
         }
 
-        return (enums, refTypes);
+        return enums;
     }
 
     public static string FormatDefaultValue(
@@ -291,7 +243,12 @@ internal static class ConstantAndAttributeReader
         return null;
     }
 
-    public static byte? ReadTopLevelNullableFlag(MetadataReader md, CustomAttributeHandleCollection attrs)
+    /// <summary>
+    /// Reads <c>NullableAttribute</c> flags for one type reference: either the single-byte form (applies to every
+    /// position) or the per-position <c>byte[]</c> form. Returns null when the attribute is absent, in which case
+    /// the enclosing <c>NullableContextAttribute</c> value applies.
+    /// </summary>
+    public static NullableFlags? ReadNullableFlags(MetadataReader md, CustomAttributeHandleCollection attrs)
     {
         foreach (var ah in attrs)
         {
@@ -304,17 +261,18 @@ internal static class ConstantAndAttributeReader
                 if (br.Length < 5 || br.ReadUInt16() != 0x0001)
                     return null;
 
-                // NullableAttribute(byte) has fixed 5-byte blob: 01 00 <flag> 00 00
+                // NullableAttribute(byte): 01 00 <flag> 00 00
                 if (br.Length == 5)
-                    return br.ReadByte();
+                    return NullableFlags.Uniform(br.ReadByte());
 
-                // NullableAttribute(byte[]) has 01 00 <int32 len> <b0..> <uint16 numNamed>
-                if (br.Length >= 8)
-                {
-                    var arrLen = br.ReadInt32();
-                    if (arrLen > 0 && br.RemainingBytes >= 1)
-                        return br.ReadByte();
-                }
+                // NullableAttribute(byte[]): 01 00 <int32 count> <bytes...> <uint16 numNamed>
+                var count = br.ReadInt32();
+                if (count < 0 || count > br.RemainingBytes)
+                    return null;
+                var flags = new byte[count];
+                for (var i = 0; i < count; i++)
+                    flags[i] = br.ReadByte();
+                return NullableFlags.PerPosition(flags);
             }
             catch
             {
@@ -322,39 +280,6 @@ internal static class ConstantAndAttributeReader
             }
         }
         return null;
-    }
-
-    public static string ApplyTopLevelNullability(
-        string displayType,
-        byte? attrFlag,
-        byte contextFlag,
-        ReferenceTypeLookup refTypes,
-        GenericContext? genericCtx = null)
-    {
-        if (string.IsNullOrEmpty(displayType) ||
-            displayType == "void" ||
-            displayType.EndsWith('?') ||
-            displayType.EndsWith('*'))
-        {
-            return displayType;
-        }
-
-        // Handle ByRef suffix '&' cleanly so `string&` -> `string?&` before `ref`/`out` extraction
-        var hasAmp = displayType.EndsWith('&');
-        var core = hasAmp ? displayType[..^1] : displayType;
-        if (core.EndsWith('?') || core.Contains('<'))
-            return displayType;
-
-        bool isNonStructGenericParam = genericCtx != null
-            && TypeNameHelper.IsGenericParamName(core, genericCtx)
-            && (genericCtx.ValueTypeGenericParams == null || !genericCtx.ValueTypeGenericParams.Contains(core));
-
-        var isNullable = attrFlag.HasValue
-            ? attrFlag.Value == 2
-            : (contextFlag == 2 && (refTypes.IsConfirmedReferenceType(core) || isNonStructGenericParam));
-
-        if (!isNullable) return displayType;
-        return hasAmp ? core + "?&" : core + "?";
     }
 
     public static string? ReadDefaultMemberName(MetadataReader md, TypeDefinition td)

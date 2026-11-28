@@ -233,107 +233,6 @@ public sealed class FullNameDisplaySignatureProvider : ISignatureTypeProvider<st
 }
 
 /// <summary>
-/// Collects structured (FullName, SimpleName) type references directly from ECMA-335 signatures
-/// without string re-parsing, preserving full namespaces while ignoring C++/CLI modopt/modreq modifiers.
-/// </summary>
-internal sealed class TypeRefCollectorProvider : ISignatureTypeProvider<IReadOnlyList<(string FullName, string SimpleName)>, GenericContext>
-{
-    public static readonly TypeRefCollectorProvider Instance = new();
-    private static readonly IReadOnlyList<(string FullName, string SimpleName)> Empty = Array.Empty<(string, string)>();
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetPrimitiveType(PrimitiveTypeCode typeCode)
-    {
-        if (typeCode == PrimitiveTypeCode.Void) return Empty;
-        var full = XmlDocSignatureProvider.Instance.GetPrimitiveType(typeCode);
-        var simple = DisplaySignatureProvider.FormatPrimitive(typeCode);
-        return new[] { (full, simple) };
-    }
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind)
-    {
-        var full = FullNameDisplaySignatureProvider.Instance.GetTypeFromDefinition(reader, handle, rawTypeKind);
-        return string.IsNullOrEmpty(full) ? Empty : new[] { (full, ExtractLeafAlias(full)) };
-    }
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind)
-    {
-        var full = FullNameDisplaySignatureProvider.Instance.GetTypeFromReference(reader, handle, rawTypeKind);
-        return string.IsNullOrEmpty(full) ? Empty : new[] { (full, ExtractLeafAlias(full)) };
-    }
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetTypeFromSpecification(
-        MetadataReader reader, GenericContext genericContext, TypeSpecificationHandle handle, byte rawTypeKind)
-        => reader.GetTypeSpecification(handle).DecodeSignature(this, genericContext);
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetSZArrayType(IReadOnlyList<(string FullName, string SimpleName)> elementType)
-        => elementType;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetArrayType(IReadOnlyList<(string FullName, string SimpleName)> elementType, ArrayShape shape)
-        => elementType;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetByReferenceType(IReadOnlyList<(string FullName, string SimpleName)> elementType)
-        => elementType;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetPointerType(IReadOnlyList<(string FullName, string SimpleName)> elementType)
-        => elementType;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetPinnedType(IReadOnlyList<(string FullName, string SimpleName)> elementType)
-        => elementType;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetModifiedType(
-        IReadOnlyList<(string FullName, string SimpleName)> modifier,
-        IReadOnlyList<(string FullName, string SimpleName)> unmodifiedType,
-        bool isRequired)
-        => unmodifiedType;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetGenericInstantiation(
-        IReadOnlyList<(string FullName, string SimpleName)> genericType,
-        ImmutableArray<IReadOnlyList<(string FullName, string SimpleName)>> typeArguments)
-    {
-        if (genericType.Count == 1 && genericType[0].FullName == "System.Nullable" && typeArguments.Length == 1)
-            return typeArguments[0];
-
-        var list = new List<(string FullName, string SimpleName)>(genericType.Count + typeArguments.Length);
-        list.AddRange(genericType);
-        foreach (var arg in typeArguments)
-            list.AddRange(arg);
-        return list;
-    }
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetGenericTypeParameter(GenericContext genericContext, int index) => Empty;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetGenericMethodParameter(GenericContext genericContext, int index) => Empty;
-
-    public IReadOnlyList<(string FullName, string SimpleName)> GetFunctionPointerType(MethodSignature<IReadOnlyList<(string FullName, string SimpleName)>> signature)
-    {
-        var list = new List<(string FullName, string SimpleName)>();
-        foreach (var pt in signature.ParameterTypes)
-            list.AddRange(pt);
-        list.AddRange(signature.ReturnType);
-        return list;
-    }
-
-    public static IReadOnlyList<(string FullName, string SimpleName)> CollectFromEntity(MetadataReader md, EntityHandle handle, GenericContext ctx)
-    {
-        if (handle.IsNil) return Empty;
-        return handle.Kind switch
-        {
-            HandleKind.TypeDefinition => Instance.GetTypeFromDefinition(md, (TypeDefinitionHandle)handle, 0),
-            HandleKind.TypeReference => Instance.GetTypeFromReference(md, (TypeReferenceHandle)handle, 0),
-            HandleKind.TypeSpecification => Instance.GetTypeFromSpecification(md, ctx, (TypeSpecificationHandle)handle, 0),
-            _ => Empty,
-        };
-    }
-
-    private static string ExtractLeafAlias(string bareFull)
-    {
-        var idx = bareFull.LastIndexOf('.');
-        var leaf = idx >= 0 ? bareFull[(idx + 1)..] : bareFull;
-        return DisplaySignatureProvider.NormalizePrimitiveAlias(leaf);
-    }
-}
-
-/// <summary>
 /// Lightweight signature provider that checks whether a property setter has modreq(System.Runtime.CompilerServices.IsExternalInit).
 /// </summary>
 internal sealed class InitOnlyDetectorProvider : ISignatureTypeProvider<bool, object?>
@@ -498,5 +397,53 @@ public sealed class XmlDocSignatureProvider : ISignatureTypeProvider<string, Gen
 
     public string GetGenericMethodParameter(GenericContext genericContext, int index) => $"``{index}";
 
+    public string GetFunctionPointerType(MethodSignature<string> signature) => "System.IntPtr";
+}
+
+/// <summary>
+/// Decodes type handles into CLR (reflection-style) names: namespace-qualified, <c>+</c> between nested types,
+/// generic arity suffixes kept, and generic instantiations collapsed to their definition
+/// (e.g. <c>System.Collections.Generic.List`1</c>). These match <c>types.clr_name</c> exactly, so base classes and
+/// interfaces can be resolved without confusing <c>Foo</c> with <c>Foo&lt;T&gt;</c>.
+/// </summary>
+internal sealed class ClrNameProvider : ISignatureTypeProvider<string, GenericContext>
+{
+    public static readonly ClrNameProvider Instance = new();
+
+    public string GetPrimitiveType(PrimitiveTypeCode typeCode) => XmlDocSignatureProvider.Instance.GetPrimitiveType(typeCode);
+
+    public string GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind)
+    {
+        var td = reader.GetTypeDefinition(handle);
+        var name = reader.GetString(td.Name);
+        if (td.IsNested)
+            return GetTypeFromDefinition(reader, td.GetDeclaringType(), 0) + "+" + name;
+        var ns = reader.GetString(td.Namespace);
+        return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+    }
+
+    public string GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind)
+    {
+        var tr = reader.GetTypeReference(handle);
+        var name = reader.GetString(tr.Name);
+        if (tr.ResolutionScope.Kind == HandleKind.TypeReference)
+            return GetTypeFromReference(reader, (TypeReferenceHandle)tr.ResolutionScope, 0) + "+" + name;
+        var ns = reader.GetString(tr.Namespace);
+        return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+    }
+
+    public string GetTypeFromSpecification(MetadataReader reader, GenericContext genericContext, TypeSpecificationHandle handle, byte rawTypeKind)
+        => reader.GetTypeSpecification(handle).DecodeSignature(this, genericContext);
+
+    public string GetGenericInstantiation(string genericType, ImmutableArray<string> typeArguments) => genericType;
+
+    public string GetSZArrayType(string elementType) => elementType + "[]";
+    public string GetArrayType(string elementType, ArrayShape shape) => $"{elementType}[{new string(',', Math.Max(0, shape.Rank - 1))}]";
+    public string GetByReferenceType(string elementType) => elementType + "&";
+    public string GetPointerType(string elementType) => elementType + "*";
+    public string GetPinnedType(string elementType) => elementType;
+    public string GetModifiedType(string modifier, string unmodifiedType, bool isRequired) => unmodifiedType;
+    public string GetGenericTypeParameter(GenericContext genericContext, int index) => "!" + index;
+    public string GetGenericMethodParameter(GenericContext genericContext, int index) => "!!" + index;
     public string GetFunctionPointerType(MethodSignature<string> signature) => "System.IntPtr";
 }

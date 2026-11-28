@@ -1,15 +1,16 @@
 ---
-name: csharp-definition-lookup
-description: Fast offline .NET API metadata & XML-doc lookup powered by System.Reflection.Metadata + SQLite FTS5. Use to search types/members/XML docs across .csproj references, NuGet packages, or SDK directories (Revit, AutoCAD, Plant 3D, etc.), inspect clean C# API skeletons (with inherited members and extension methods), explore type hierarchies, and reverse-lookup methods returning/accepting a type. Use csharp-decompiler only when you need method bodies or internal implementation details.
+name: dotnet-api-lookup
+description: Fast offline .NET API metadata & XML-doc lookup powered by System.Reflection.Metadata + SQLite FTS5. Use to search types/members/XML docs across .csproj references, NuGet packages, or SDK directories (Revit, AutoCAD, Plant 3D, etc.), inspect clean C# API skeletons (with inherited members and extension methods), explore type hierarchies, and reverse-lookup methods returning/accepting a type. Use dotnet-decompiler only when you need method bodies or internal implementation details.
 ---
 
-# C# Definition & API Lookup
+# .NET API Lookup
 
-Offline .NET metadata & XML documentation indexer (`System.Reflection.Metadata` + SQLite FTS5). Extracts clean C# signatures (including nullable annotations, `ref`/`readonly` structs, `ref` returns, `[Flags]` & `decimal` constants), class/interface inheritance chains, extension methods (including constrained generic extensions), enum values, type forwarders, and companion `.xml` docs directly from PE assemblies—without loading them into a host process or decompiling noisy IL.
+Offline .NET metadata & XML documentation indexer (`System.Reflection.Metadata` + SQLite FTS5). Extracts clean C# signatures (including full nullable annotations at every position such as `Dictionary<string, object?>?` and `string?[]`, `ref`/`readonly` structs, `ref` returns, `[Flags]` & `decimal` constants), class/interface inheritance chains (resolved by exact generic arity, so `Foo` and `Foo<T>` never mix), extension methods (including constrained generic extensions), enum values, type forwarders, and companion `.xml` docs (with `<inheritdoc/>` resolved across indexed assemblies) directly from PE assemblies—without loading them into a host process or decompiling noisy IL.
 
 ## Tool Location
 
 - **Windows (ready to run, requires .NET 8+ runtime)**: `<skill_dir>/scripts/apilookup.exe`
+- **Standalone Native AOT (Windows / Linux / macOS, zero .NET runtime required)**: Download `apilookup-<rid>.zip` / `.tar.gz` from [GitHub Releases](../../releases), or build locally with `<repo>/tools/build.ps1 -Aot`
 - **.NET Global/Local Tool**: `dotnet pack <repo>/src/ApiLookup -c Release` then `dotnet tool install -g --add-source <nupkg_dir> ApiLookup` (`apilookup`)
 - **Cross-platform / from source**: `dotnet run --project <repo>/src/ApiLookup -- <args>`
 - **Rebuild binary**: `<repo>/tools/build.ps1`
@@ -24,19 +25,19 @@ No `dotnet-script` required.
 | `show <TypeName>` | Print clean C# API skeleton (constructors, properties, methods, events, fields/enums, delegates) |
 | `hierarchy <TypeName>` | Show base class/interface chain, interfaces, and all derived/implementing types |
 | `by-type <TypeName>` | Reverse-lookup members returning or accepting `<TypeName>` (supports full namespace or simple name, including inside generic containers) |
-| `locate <TypeName>` | Fast zero-cache PE scan (including `[TypeForwardedTo]` facades) to locate a type's exact DLL & namespace (alias: `scan`) |
+| `locate <TypeName>` | Fast zero-cache PE scan (`--dir`/`--project`/`--dll`, including `[TypeForwardedTo]` facades) to locate a type's exact DLL & namespace |
 | `index` | Build/refresh a named index (`--name`), list (`--list`), delete (`--drop`), or prune auto-cache (`--prune`) |
 | `refs` | List indexed assemblies, versions, type counts, and XML doc availability |
 
 ## Specifying Sources (Auto-Cached)
 
-Every command accepts any combination of `--dir`, `--project`, `--dll`, or a previously built `--index <name>`:
+Query and `index` commands accept any combination of `--dir`, `--project`, `--dll`, or a previously built `--index <name>` (`locate` operates directly on `--dir`/`--project`/`--dll` without building or reading an index):
 
 - `--dir <path>` (repeatable): Recursively scan managed `.dll` and `.exe` assemblies (automatically skips native-only binaries, `*.resources.dll`, and locale folders). Pair with `--include <glob>` / `--exclude <glob>` (e.g. `--exclude "DevExpress.*"`) to keep large SDK directories small and fast.
-- `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first), project references (honoring custom `<AssemblyName>`), plus `<HintPath>` references (expanding `$(ProjectDir)`, `$(SolutionDir)`, and MSBuild properties from `.csproj` / ancestor `Directory.Build.props`). For multi-TFM projects, automatically selects the highest framework or pass `--tfm <tfm>` (e.g. `--tfm net8.0`).
+- `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first; package roots come from its `packageFolders`, so custom `globalPackagesFolder` / fallback folders work), project references (honoring custom `<AssemblyName>`), plus `<HintPath>` references (expanding `$(ProjectDir)`, `$(SolutionDir)`, and MSBuild properties from `.csproj` / ancestor `Directory.Build.props`). For multi-TFM projects, automatically selects the highest framework or pass `--tfm <tfm>` (e.g. `--tfm net8.0`).
 - `--dll <path.dll>` (repeatable): Index specific assembly files directly.
 - `--index <name>` (alias `--name`): Build once with `index --name <name> ...`, then reuse instantly (`<50 ms`) across queries.
-- Ad-hoc `--dir`/`--project`/`--dll` queries are **auto-cached** by file size + mtime fingerprint in `%LOCALAPPDATA%\csharp-api-lookup\indexes\` (or `~/.cache/csharp-api-lookup/indexes/`, overridable via `APILOOKUP_CACHE_DIR`). Run `apilookup.exe index --prune` to clean up old `auto-*.db` files.
+- Ad-hoc `--dir`/`--project`/`--dll` queries are **auto-cached** by directory stat fingerprint (paths, sizes, mtimes, and companion `.xml` files) in `%LOCALAPPDATA%\csharp-api-lookup\indexes\` (or `~/.cache/csharp-api-lookup/indexes/`, overridable via `APILOOKUP_CACHE_DIR`). Cache hits on `--dir` skip opening every binary's PE header; run `apilookup.exe index --prune` to clean up old `auto-*.db` files and leftover temp files from interrupted builds.
 
 ## Recommended Workflows
 
@@ -97,14 +98,14 @@ apilookup.exe by-type DataLinksManager3d --index acad2025
 apilookup.exe by-type Autodesk.Revit.DB.Wall --index revit2026 --role return --limit 20
 ```
 
-## When to Escalate to `csharp-decompiler`
+## When to Escalate to `dotnet-decompiler`
 
-Use `csharp-definition-lookup` **first** for:
+Use `dotnet-api-lookup` **first** for:
 - Finding which DLL and namespace a type lives in (including `[TypeForwardedTo]` facade redirects)
 - Checking method signatures, overloads, optional parameters, enums, XML docs
 - Discovering inherited members, extension methods, subclasses, and factory methods
 
-Escalate to `csharp-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when you need method implementation details** (e.g., hidden side effects, native interop preconditions, or internal error-dialog class names). `show` prints the exact `Assembly` path and `CLR Name` needed by `ilspycmd`.
+Escalate to `dotnet-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when you need method implementation details** (e.g., hidden side effects, native interop preconditions, or internal error-dialog class names). `show` prints the exact `Assembly` path and `CLR Name` needed by `ilspycmd`.
 
 ## Tips & Notes
 
@@ -112,6 +113,7 @@ Escalate to `csharp-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when
 - **Filter large install directories** with `--include` / `--exclude` (e.g. `--exclude "DevExpress.*"`) to avoid indexing hundreds of bundled third-party UI DLLs.
 - **Non-public members**: By default only `public` and `protected` APIs are indexed (which also strips C++/CLI native internal structs). Pass `--include-nonpublic` if reverse-engineering internal types.
 - **Structured output**: Any command supports `--json` (emitting consistent `camelCase` JSON, including structured `{ "error", "exitCode" }` envelopes on failure).
-- **Diagnostics & Version**: Pass `--verbose` to inspect metadata/XML warnings on stderr, and `--version` to check the CLI version.
+- **Diagnostics & Version**: Pass `--verbose` to inspect metadata/XML warnings, phase timing breakdown (`[timing] ...`), and error stack traces on stderr, and `--version` (add `--verbose` for commit/source hash/runtime) to check the CLI version.
 - **Exit codes**: `0` success, `1` error or type not found, `2` ambiguous type match in `show`/`hierarchy` (candidates printed to stdout).
-- **Zero-cache DLL scan**: Use `locate <TypeName>` (alias `scan`) with `--project` / `--dir` / `--dll` when you only want to find which DLL defines or forwards a type without creating a SQLite index.
+- **Strict CLI**: Options are validated per command (e.g. `--role` only on `by-type`, `--member` only on `show`) and mistyped commands like `serach` fail with a suggestion instead of silently searching. A bare word that is not a command (e.g. `apilookup Wall --index revit2026`) is still treated as `search`.
+- **Zero-cache DLL scan**: Use `locate <TypeName>` with `--project` / `--dir` / `--dll` before indexing a huge directory, when resolving `[TypeForwardedTo]` facades, or when you just need an assembly path for `ilspycmd`. Once an `--index` exists, use `search` or `show`.

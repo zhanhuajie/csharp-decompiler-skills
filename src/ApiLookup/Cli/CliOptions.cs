@@ -5,6 +5,9 @@ public sealed class CliOptions
     public string Command { get; set; } = string.Empty;
     public List<string> Positional { get; } = new();
 
+    /// <summary>Canonical option name -> first spelling the user typed (e.g. "namespace" -> "--ns"). Used for per-command validation.</summary>
+    public Dictionary<string, string> SpecifiedOptions { get; } = new(StringComparer.Ordinal);
+
     // Sources / Index selection
     public string? IndexName { get; set; }
     public string? DbPath { get; set; }

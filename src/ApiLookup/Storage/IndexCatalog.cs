@@ -79,10 +79,12 @@ public static class IndexCatalog
     {
         var dir = cacheDir ?? DefaultCacheDirectory();
         if (!Directory.Exists(dir))
-            return new PruneResult(0, 0, Array.Empty<string>());
+            return new PruneResult(0, 0, Array.Empty<string>(), 0);
 
         var removed = new List<string>();
         long freedBytes = 0;
+        var removedIndexCount = 0;
+        var removedTempCount = 0;
 
         foreach (var file in Directory.GetFiles(dir, "auto-*.db").OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
         {
@@ -93,6 +95,7 @@ public static class IndexCatalog
                 TryDeleteUnlockedFile(file + ".lock");
                 removed.Add(file);
                 freedBytes += len;
+                removedIndexCount++;
             }
             catch
             {
@@ -100,7 +103,87 @@ public static class IndexCatalog
             }
         }
 
-        return new PruneResult(removed.Count, freedBytes, removed);
+        // Leftover temp databases from interrupted builds (killed process, power loss, etc.)
+        foreach (var file in Directory.GetFiles(dir, "*" + TempBuildMarker + "*").OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+        {
+            if (!IsStaleTempBuildFile(file)) continue;
+            try
+            {
+                var len = new FileInfo(file).Length;
+                File.Delete(file);
+                removed.Add(file);
+                freedBytes += len;
+                removedTempCount++;
+            }
+            catch
+            {
+                // Still in use; leave it alone
+            }
+        }
+
+        return new PruneResult(removedIndexCount, freedBytes, removed, removedTempCount);
+    }
+
+    /// <summary>Marker inserted between the target DB path and the owner PID for in-progress builds.</summary>
+    internal const string TempBuildMarker = ".tmp-";
+
+    /// <summary>Temp builds older than this are considered abandoned even if their PID was reused.</summary>
+    internal static readonly TimeSpan TempBuildMaxAge = TimeSpan.FromHours(24);
+
+    internal static string CreateTempBuildPath(string dbPath)
+        => $"{dbPath}{TempBuildMarker}{Environment.ProcessId}-{Guid.NewGuid():N}";
+
+    /// <summary>
+    /// A temp build file is stale when its owning process (encoded in the file name) is no longer running,
+    /// or when it has not been modified for <see cref="TempBuildMaxAge"/>.
+    /// </summary>
+    internal static bool IsStaleTempBuildFile(string path)
+    {
+        var name = Path.GetFileName(path);
+        var markerIdx = name.LastIndexOf(TempBuildMarker, StringComparison.Ordinal);
+        if (markerIdx < 0) return false;
+
+        try
+        {
+            if (DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TempBuildMaxAge)
+                return true;
+        }
+        catch
+        {
+            return false;
+        }
+
+        var rest = name[(markerIdx + TempBuildMarker.Length)..];
+        var dash = rest.IndexOf('-');
+        if (dash <= 0 || !int.TryParse(rest[..dash], out var pid))
+            return false;
+
+        return !IsProcessAlive(pid);
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false; // No process with this id
+        }
+        catch
+        {
+            return true; // Access denied etc.: assume alive to stay safe
+        }
+    }
+
+    /// <summary>True when <paramref name="dbPath"/> follows the auto-cache naming scheme (auto-&lt;key&gt;.db).</summary>
+    public static bool IsAutoCachePath(string dbPath)
+    {
+        var name = Path.GetFileName(dbPath);
+        return name.StartsWith("auto-", StringComparison.OrdinalIgnoreCase) &&
+               name.EndsWith(".db", StringComparison.OrdinalIgnoreCase);
     }
 
     public static IDisposable AcquireBuildLock(string dbPath, TimeSpan? timeout = null)

@@ -306,6 +306,68 @@ namespace ApiLookup.Tests.Fixtures
     {
         public int SecretCode { get; set; }
     }
+
+    /// <summary>Nullable-annotation fixtures exercising nested positions and cross-assembly reference types.</summary>
+    public static class SampleNullability
+    {
+        public static List<string?>? GetNames(Dictionary<string, object?> map, string?[] items, string[]? maybeItems) => null;
+
+        // Every position annotated: the compiler emits only NullableContext(2) on the method and no per-parameter attributes.
+        public static System.Text.StringBuilder? Build(System.Text.StringBuilder? a, System.Text.StringBuilder? b) => a;
+
+        public static KeyValuePair<string?, int> Pair((string? Name, int Count) tuple) => default;
+
+        public static T? FirstOrNull<T>(IEnumerable<T?> items) where T : class => null;
+
+        public static T Pick<T>(T value, T? fallback) where T : struct => value;
+    }
+
+    /// <summary>Non-generic arity twin.</summary>
+    public class SampleArity
+    {
+    }
+
+    /// <summary>Generic arity twin sharing the same bare name.</summary>
+    public class SampleArity<T>
+    {
+    }
+
+    public class DerivedFromArity : SampleArity
+    {
+    }
+
+    public class DerivedFromGenericArity : SampleArity<int>
+    {
+    }
+
+    /// <summary>Documented valve contract.</summary>
+    public interface ISampleValve
+    {
+        /// <summary>Opens the valve to the requested percentage.</summary>
+        /// <param name="percent">Opening ratio from 0 to 100.</param>
+        void Open(int percent);
+    }
+
+    /// <summary>Base valve with documented flow computation.</summary>
+    public abstract class SampleValveBase
+    {
+        /// <summary>Computes the volumetric flow rate through the valve.</summary>
+        /// <returns>Flow in cubic meters per hour.</returns>
+        public virtual double ComputeFlow(double pressure) => pressure;
+    }
+
+    /// <inheritdoc/>
+    public sealed class SampleGateValve : SampleValveBase, ISampleValve
+    {
+        /// <inheritdoc/>
+        public override double ComputeFlow(double pressure) => pressure * 2;
+
+        /// <inheritdoc/>
+        public void Open(int percent) { }
+
+        /// <inheritdoc cref="SampleBaseEntity.Translate(double, double)"/>
+        public void Shift(double dx, double dy) { }
+    }
 }
 
 namespace ApiLookup.Tests.OtherNs

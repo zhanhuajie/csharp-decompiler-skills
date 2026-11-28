@@ -154,12 +154,12 @@ public class IndexStoreTests : IDisposable
         // Generic base-class formatting preserves generic arguments in FormatTypeHeader & Search
         var pipeContainer = store.ResolveType("SamplePipeContainer").Single();
         Assert.Equal("public class SamplePipeContainer : SampleContainer<SamplePipeSegment>", OutputFormatter.FormatTypeHeader(pipeContainer));
-        var pipeContainerHit = store.Search("SamplePipeContainer", kindFilter: "type").Single(h => h.Name == "SamplePipeContainer");
+        var pipeContainerHit = OutputFormatter.ToSearchHits(store.Search("SamplePipeContainer", kindFilter: "type")).Single(h => h.Name == "SamplePipeContainer");
         Assert.Contains(": SampleContainer<SamplePipeSegment>", pipeContainerHit.Signature);
 
         var stringList = store.ResolveType("SampleStringList").Single();
         Assert.Equal("public class SampleStringList : List<string>", OutputFormatter.FormatTypeHeader(stringList));
-        var stringListHit = store.Search("SampleStringList", kindFilter: "type").Single(h => h.Name == "SampleStringList");
+        var stringListHit = OutputFormatter.ToSearchHits(store.Search("SampleStringList", kindFilter: "type")).Single(h => h.Name == "SampleStringList");
         Assert.Contains(": List<string>", stringListHit.Signature);
 
         // Interface inheritance chain: IDerivedSampleItem -> ISampleItem

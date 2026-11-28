@@ -5,11 +5,16 @@ using System.Xml.Linq;
 
 namespace ApiLookup;
 
+/// <param name="InheritDocCref">
+/// <c>null</c> when the member has no <c>&lt;inheritdoc/&gt;</c>; empty string for <c>&lt;inheritdoc/&gt;</c> without
+/// <c>cref</c> (inherit from the overridden/implemented member); otherwise the <c>cref</c> doc ID to copy from.
+/// </param>
 public sealed record XmlDocEntry(
     string? Summary,
     string? Remarks,
     string? Returns,
-    IReadOnlyDictionary<string, string> Params);
+    IReadOnlyDictionary<string, string> Params,
+    string? InheritDocCref = null);
 
 public sealed class XmlDocBook
 {
@@ -45,6 +50,8 @@ public static partial class XmlDocReader
     [GeneratedRegex(@"\s+")]
     private static partial Regex MultiSpaceRegex();
 
+    internal static readonly string[] LocaleSubdirs = { "en", "en-US", "zh-Hans", "zh-CN" };
+
     public static string? FindXmlDocPath(string assemblyPath)
     {
         var xml = Path.ChangeExtension(assemblyPath, ".xml");
@@ -54,7 +61,7 @@ public static partial class XmlDocReader
         if (string.IsNullOrEmpty(dir)) return null;
         var fileName = Path.GetFileName(xml);
 
-        foreach (var sub in new[] { "en", "en-US", "zh-Hans", "zh-CN" })
+        foreach (var sub in LocaleSubdirs)
         {
             var candidate = Path.Combine(dir, sub, fileName);
             if (File.Exists(candidate)) return candidate;
@@ -110,10 +117,13 @@ public static partial class XmlDocReader
                         paramDict[pName] = pText;
                 }
 
-                if (summary == null && remarks == null && returns == null && valueDoc == null && paramDict.Count == 0)
+                var inheritDoc = m.Element("inheritdoc");
+                var inheritDocCref = inheritDoc == null ? null : (inheritDoc.Attribute("cref")?.Value?.Trim() ?? string.Empty);
+
+                if (summary == null && remarks == null && returns == null && valueDoc == null && paramDict.Count == 0 && inheritDocCref == null)
                     continue;
 
-                var entry = new XmlDocEntry(summary, remarks, returns, paramDict);
+                var entry = new XmlDocEntry(summary, remarks, returns, paramDict, inheritDocCref);
                 exact[name] = entry;
 
                 // Fallback key for methods with C++/CLI signature quirks: M:FullType.MethodName#paramCount.
