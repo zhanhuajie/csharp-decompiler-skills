@@ -10,7 +10,7 @@ Offline .NET metadata & XML documentation indexer (`System.Reflection.Metadata` 
 ## Tool Location
 
 - **Windows (ready to run, requires .NET 8+ runtime)**: `<skill_dir>/scripts/apilookup.exe`
-- **Standalone Native AOT (Windows / Linux / macOS, zero .NET runtime required)**: Download `apilookup-<rid>.zip` / `.tar.gz` from [GitHub Releases](../../releases), or build locally with `<repo>/tools/build.ps1 -Aot`
+- **Standalone Native AOT (Windows / Linux / macOS, zero .NET runtime required)**: Download `apilookup-<rid>.zip` / `.tar.gz` from [GitHub Releases](../../../releases), or build locally with `<repo>/tools/build.ps1 -Aot`
 - **.NET Global/Local Tool**: `dotnet pack <repo>/src/ApiLookup -c Release` then `dotnet tool install -g --add-source <nupkg_dir> ApiLookup` (`apilookup`)
 - **Cross-platform / from source**: `dotnet run --project <repo>/src/ApiLookup -- <args>`
 - **Rebuild binary**: `<repo>/tools/build.ps1`
