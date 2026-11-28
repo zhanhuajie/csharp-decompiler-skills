@@ -94,6 +94,7 @@ jobs:
           if ("${{ matrix.archive_ext }}" -eq "zip") {
             Compress-Archive -Path "stage/*" -DestinationPath $archive -Force
           } else {
+            chmod +x "stage/${{ matrix.exe }}"
             tar -czf $archive -C stage .
           }
 
@@ -123,5 +124,5 @@ jobs:
           sha256sum apilookup-* > SHA256SUMS.txt
           ls -la
           cat SHA256SUMS.txt
-          gh release create "$TAG" apilookup-* SHA256SUMS.txt --title "$TAG" --generate-notes || \
-            gh release upload "$TAG" apilookup-* SHA256SUMS.txt --clobber
+          gh release create "$TAG" apilookup-* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes || \
+            gh release upload "$TAG" apilookup-* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
