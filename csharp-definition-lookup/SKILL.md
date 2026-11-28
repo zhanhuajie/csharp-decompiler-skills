@@ -25,13 +25,13 @@ No `dotnet-script` required.
 | `show <TypeName>` | Print clean C# API skeleton (constructors, properties, methods, events, fields/enums, delegates) |
 | `hierarchy <TypeName>` | Show base class/interface chain, interfaces, and all derived/implementing types |
 | `by-type <TypeName>` | Reverse-lookup members returning or accepting `<TypeName>` (supports full namespace or simple name, including inside generic containers) |
-| `locate <TypeName>` | Fast zero-cache PE scan (including `[TypeForwardedTo]` facades) to locate a type's exact DLL & namespace (alias: `scan`) |
+| `locate <TypeName>` | Fast zero-cache PE scan (`--dir`/`--project`/`--dll`, including `[TypeForwardedTo]` facades) to locate a type's exact DLL & namespace |
 | `index` | Build/refresh a named index (`--name`), list (`--list`), delete (`--drop`), or prune auto-cache (`--prune`) |
 | `refs` | List indexed assemblies, versions, type counts, and XML doc availability |
 
 ## Specifying Sources (Auto-Cached)
 
-Every command accepts any combination of `--dir`, `--project`, `--dll`, or a previously built `--index <name>`:
+Query and `index` commands accept any combination of `--dir`, `--project`, `--dll`, or a previously built `--index <name>` (`locate` operates directly on `--dir`/`--project`/`--dll` without building or reading an index):
 
 - `--dir <path>` (repeatable): Recursively scan managed `.dll` and `.exe` assemblies (automatically skips native-only binaries, `*.resources.dll`, and locale folders). Pair with `--include <glob>` / `--exclude <glob>` (e.g. `--exclude "DevExpress.*"`) to keep large SDK directories small and fast.
 - `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first; package roots come from its `packageFolders`, so custom `globalPackagesFolder` / fallback folders work), project references (honoring custom `<AssemblyName>`), plus `<HintPath>` references (expanding `$(ProjectDir)`, `$(SolutionDir)`, and MSBuild properties from `.csproj` / ancestor `Directory.Build.props`). For multi-TFM projects, automatically selects the highest framework or pass `--tfm <tfm>` (e.g. `--tfm net8.0`).
@@ -116,4 +116,4 @@ Escalate to `csharp-decompiler` (`ilspycmd -t <FullName> <DllPath>`) **only when
 - **Diagnostics & Version**: Pass `--verbose` to inspect metadata/XML warnings, phase timing breakdown (`[timing] ...`), and error stack traces on stderr, and `--version` (add `--verbose` for commit/source hash/runtime) to check the CLI version.
 - **Exit codes**: `0` success, `1` error or type not found, `2` ambiguous type match in `show`/`hierarchy` (candidates printed to stdout).
 - **Strict CLI**: Options are validated per command (e.g. `--role` only on `by-type`, `--member` only on `show`) and mistyped commands like `serach` fail with a suggestion instead of silently searching. A bare word that is not a command (e.g. `apilookup Wall --index revit2026`) is still treated as `search`.
-- **Zero-cache DLL scan**: Use `locate <TypeName>` (alias `scan`) with `--project` / `--dir` / `--dll` when you only want to find which DLL defines or forwards a type without creating a SQLite index.
+- **Zero-cache DLL scan**: Use `locate <TypeName>` with `--project` / `--dir` / `--dll` before indexing a huge directory, when resolving `[TypeForwardedTo]` facades, or when you just need an assembly path for `ilspycmd`. Once an `--index` exists, use `search` or `show`.

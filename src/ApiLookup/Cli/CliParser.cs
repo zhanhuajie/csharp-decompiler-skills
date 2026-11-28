@@ -222,7 +222,12 @@ internal static class CliParser
         foreach (var (option, typed) in opts.SpecifiedOptions)
         {
             if (!spec.AllowedOptions.Contains(option))
-                throw new ArgumentException($"Option '{typed}' is not valid for '{opts.Command}'. Run 'apilookup --help' for usage.");
+            {
+                var hint = spec.Name == "locate" && option is "index" or "db"
+                    ? " 'locate' performs a zero-cache PE scan over --dir/--project/--dll; use 'search' or 'show' for indexed queries."
+                    : " Run 'apilookup --help' for usage.";
+                throw new ArgumentException($"Option '{typed}' is not valid for '{opts.Command}'.{hint}");
+            }
         }
 
         switch (spec.Arity)

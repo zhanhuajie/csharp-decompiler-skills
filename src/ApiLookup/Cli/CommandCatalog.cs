@@ -13,7 +13,6 @@ internal sealed record CommandContext(CliOptions Options, TextWriter Out, TextWr
 /// <summary>Declarative description of a CLI command: its name, accepted options, positional arity, and handler.</summary>
 internal sealed record CommandSpec(
     string Name,
-    IReadOnlyList<string> Aliases,
     PositionalArity Arity,
     string ArgumentName,
     IReadOnlySet<string> AllowedOptions,
@@ -23,6 +22,9 @@ internal sealed record CommandSpec(
 internal static class CommandCatalog
 {
     public static readonly string[] GlobalOptions = { "help", "version", "json", "verbose" };
+
+    public static readonly string[] DirectSourceOptions =
+        { "project", "dir", "dll", "include", "exclude", "no-recursive", "include-nonpublic", "tfm" };
 
     public static readonly string[] SourceOptions =
         { "index", "db", "project", "dir", "dll", "include", "exclude", "no-recursive", "include-nonpublic", "force", "tfm" };
@@ -42,16 +44,16 @@ internal static class CommandCatalog
             SourceOptions, new[] { "namespace", "assembly", "role", "limit" }),
         Spec("refs", PositionalArity.None, "", CommandHandlers.RunRefs, SourceOptions),
         Spec("locate", PositionalArity.ExactlyOne, "<TypeName>", CommandHandlers.RunLocate,
-            SourceOptions, new[] { "namespace", "assembly", "limit", "list-refs" }) with { Aliases = new[] { "scan" } },
+            DirectSourceOptions, new[] { "namespace", "assembly", "limit", "list-refs" }),
     };
 
     private static readonly Dictionary<string, CommandSpec> ByName = BuildLookup();
 
-    /// <summary>All command names and aliases (used for typo suggestions).</summary>
+    /// <summary>All command names (used for typo suggestions).</summary>
     public static IEnumerable<string> AllNames => ByName.Keys;
 
-    public static bool TryGet(string nameOrAlias, out CommandSpec spec)
-        => ByName.TryGetValue(nameOrAlias, out spec!);
+    public static bool TryGet(string name, out CommandSpec spec)
+        => ByName.TryGetValue(name, out spec!);
 
     private static CommandSpec Spec(
         string name,
@@ -62,17 +64,14 @@ internal static class CommandCatalog
     {
         var allowed = new HashSet<string>(GlobalOptions, StringComparer.Ordinal);
         foreach (var group in optionGroups) allowed.UnionWith(group);
-        return new CommandSpec(name, Array.Empty<string>(), arity, argumentName, allowed, handler);
+        return new CommandSpec(name, arity, argumentName, allowed, handler);
     }
 
     private static Dictionary<string, CommandSpec> BuildLookup()
     {
         var map = new Dictionary<string, CommandSpec>(StringComparer.OrdinalIgnoreCase);
         foreach (var spec in All)
-        {
             map.Add(spec.Name, spec);
-            foreach (var alias in spec.Aliases) map.Add(alias, spec);
-        }
         return map;
     }
 }

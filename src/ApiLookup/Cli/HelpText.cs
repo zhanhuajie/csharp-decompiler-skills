@@ -43,7 +43,7 @@ Commands:
   show <TypeName>              Print clean C# API skeleton (members, XML docs, inherited, extensions)
   hierarchy <TypeName>         Show base class/interface chain, interfaces, and derived/implementing types
   by-type <TypeName>           Find methods/properties/ctors returning or accepting <TypeName>
-  locate <TypeName>            Fast zero-cache PE scan to locate a type's DLL & namespace (alias: scan)
+  locate <TypeName>            Fast zero-cache PE scan (--dir/--project/--dll) to find a type's DLL, namespace & forwarders
   refs                         List indexed assemblies and XML doc availability
 
 Source & Index Options (usable on any command; auto-cached by file fingerprint):

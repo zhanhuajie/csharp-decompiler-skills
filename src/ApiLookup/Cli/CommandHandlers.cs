@@ -127,58 +127,42 @@ internal static class CommandHandlers
     public static int RunLocate(CommandContext ctx)
     {
         var opts = ctx.Options;
+        if (!HasExplicitSources(opts))
+            throw new ArgumentException("locate requires at least one source (--dir, --project, or --dll).");
+
         var typeQuery = opts.Positional[0];
         var limit = opts.Limit ?? 100;
+        Action<string>? timing = opts.Verbose ? msg => ctx.Err.WriteLine($"[timing] {msg}") : null;
 
-        if (HasExplicitSources(opts))
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var discovered = DiscoverSources(ctx, resolveXmlDocs: false);
+        timing?.Invoke($"discover {discovered.Candidates.Count} candidate binaries {sw.ElapsedMilliseconds} ms");
+
+        sw.Restart();
+        var scanWarnings = new List<string>();
+        var scan = TypeLocator.LocateCandidates(
+            discovered.Candidates,
+            typeQuery,
+            opts.NamespaceFilter,
+            opts.AssemblyFilter,
+            opts.IncludeNonPublic,
+            limit,
+            collectRefGroups: opts.ListRefs,
+            warnings: scanWarnings);
+        timing?.Invoke($"locate-scan {scan.ScannedAssemblies} managed assemblies {sw.ElapsedMilliseconds} ms");
+
+        WriteWarnings(ctx, scan.DirectNonManagedWarnings);
+        if (opts.Verbose)
         {
-            var resolved = ResolveSources(ctx);
-
-            IReadOnlyList<ResolvedRefGroup>? refGroups = null;
-            if (opts.ListRefs)
-            {
-                refGroups = resolved.Assemblies
-                    .GroupBy(a => a.Group, StringComparer.OrdinalIgnoreCase)
-                    .Select(g => new ResolvedRefGroup(g.First().Group, g.Count()))
-                    .ToList();
-            }
-
-            var scanWarnings = new List<string>();
-            var hits = TypeLocator.Locate(
-                resolved.Assemblies,
-                typeQuery,
-                opts.NamespaceFilter,
-                opts.AssemblyFilter,
-                opts.IncludeNonPublic,
-                limit,
-                scanWarnings);
-
-            if (opts.Verbose)
-            {
-                foreach (var w in scanWarnings)
-                    ctx.Err.WriteLine($"Warning: {w}");
-            }
-
-            OutputFormatter.WriteLocateHits(typeQuery, resolved.Assemblies.Count, refGroups, hits, opts.Json, ctx.Out);
-            return 0;
+            foreach (var w in scanWarnings)
+                ctx.Err.WriteLine($"Warning: {w}");
         }
 
-        if (HasNamedIndex(opts))
-        {
-            using var store = OpenNamedIndex(opts);
-            var assemblies = store.ListAssemblies();
-            var matches = store.ResolveType(typeQuery, opts.NamespaceFilter, opts.AssemblyFilter)
-                .Take(limit)
-                .Select(t => new LocateHit(t.FullName, t.ClrName, t.Namespace, t.SimpleName, t.Accessibility, t.AssemblyName, t.AssemblyPath, t.AssemblyName))
-                .ToList();
-            IReadOnlyList<ResolvedRefGroup>? refGroups = opts.ListRefs
-                ? assemblies.Select(a => new ResolvedRefGroup(a.Name, 1)).ToList()
-                : null;
-            OutputFormatter.WriteLocateHits(typeQuery, assemblies.Count, refGroups, matches, opts.Json, ctx.Out);
-            return 0;
-        }
+        if (scan.ScannedAssemblies == 0)
+            throw new InvalidOperationException("No managed .NET assemblies found in the specified sources.");
 
-        throw new ArgumentException("No source or index specified. Pass --dir <path>, --project <csproj>, --dll <path>, or --index <name>.");
+        OutputFormatter.WriteLocateHits(typeQuery, scan.ScannedAssemblies, scan.ReferenceGroups, scan.Hits, opts.Json, ctx.Out);
+        return 0;
     }
 
     // ---- Shared helpers -------------------------------------------------------------------------------
@@ -286,11 +270,8 @@ internal static class CommandHandlers
         return result;
     }
 
-    /// <summary>Resolves --dir/--project/--dll into managed assemblies, printing resolver warnings to stderr.</summary>
-    private static ResolvedSources ResolveSources(CommandContext ctx) => ProbeSources(ctx, DiscoverSources(ctx));
-
     /// <summary>Cheap discovery (directory listings + file metadata only); prints discovery warnings.</summary>
-    private static DiscoveredSources DiscoverSources(CommandContext ctx)
+    private static DiscoveredSources DiscoverSources(CommandContext ctx, bool resolveXmlDocs = true)
     {
         var opts = ctx.Options;
         var discovered = SourceResolver.Discover(
@@ -301,7 +282,8 @@ internal static class CommandHandlers
             opts.IncludePatterns,
             opts.ExcludePatterns,
             opts.IncludeNonPublic,
-            opts.TargetFramework);
+            opts.TargetFramework,
+            resolveXmlDocs);
         WriteWarnings(ctx, discovered.Warnings);
         return discovered;
     }

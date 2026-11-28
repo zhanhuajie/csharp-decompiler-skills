@@ -77,7 +77,8 @@ public static partial class SourceResolver
         IReadOnlyList<string>? includePatterns = null,
         IReadOnlyList<string>? excludePatterns = null,
         bool includeNonPublic = false,
-        string? targetFramework = null)
+        string? targetFramework = null,
+        bool resolveXmlDocs = true)
     {
         var candidates = new List<SourceCandidate>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -122,7 +123,7 @@ public static partial class SourceResolver
             return true;
         }
 
-        var xmlCache = new DirectoryXmlCache();
+        var xmlCache = resolveXmlDocs ? new DirectoryXmlCache() : null;
 
         var directCount = 0;
         foreach (var raw in dllPaths)
@@ -199,26 +200,34 @@ public static partial class SourceResolver
         }
 
         // XML companion lookup reuses cached directory *.xml listings from the scan above (or scans lazily per dir).
-        var withXml = new SourceCandidate[candidates.Count];
-        void FillXml(int i)
+        SourceCandidate[] withXml;
+        if (resolveXmlDocs)
         {
-            var c = candidates[i];
-            if (c.XmlPath != null)
+            withXml = new SourceCandidate[candidates.Count];
+            void FillXml(int i)
             {
-                var xfi = new FileInfo(c.XmlPath);
-                withXml[i] = xfi.Exists ? c with { XmlFileSize = xfi.Length, XmlMtimeUtc = xfi.LastWriteTimeUtc.Ticks } : c;
-                return;
-            }
+                var c = candidates[i];
+                if (c.XmlPath != null)
+                {
+                    var xfi = new FileInfo(c.XmlPath);
+                    withXml[i] = xfi.Exists ? c with { XmlFileSize = xfi.Length, XmlMtimeUtc = xfi.LastWriteTimeUtc.Ticks } : c;
+                    return;
+                }
 
-            var xmlFileName = Path.GetFileName(Path.ChangeExtension(c.FullPath, ".xml"));
-            withXml[i] = xmlCache.TryFind(Path.GetDirectoryName(c.FullPath), xmlFileName, out var xmlMeta)
-                ? c with { XmlPath = xmlMeta.FullPath, XmlFileSize = xmlMeta.Size, XmlMtimeUtc = xmlMeta.MtimeUtc }
-                : c;
+                var xmlFileName = Path.GetFileName(Path.ChangeExtension(c.FullPath, ".xml"));
+                withXml[i] = xmlCache!.TryFind(Path.GetDirectoryName(c.FullPath), xmlFileName, out var xmlMeta)
+                    ? c with { XmlPath = xmlMeta.FullPath, XmlFileSize = xmlMeta.Size, XmlMtimeUtc = xmlMeta.MtimeUtc }
+                    : c;
+            }
+            if (candidates.Count <= ParallelThreshold)
+                for (var i = 0; i < candidates.Count; i++) FillXml(i);
+            else
+                Parallel.For(0, candidates.Count, FillXml);
         }
-        if (candidates.Count <= ParallelThreshold)
-            for (var i = 0; i < candidates.Count; i++) FillXml(i);
         else
-            Parallel.For(0, candidates.Count, FillXml);
+        {
+            withXml = candidates.ToArray();
+        }
 
         Array.Sort(withXml, (a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.FullPath, b.FullPath));
         keyParts.Sort(StringComparer.OrdinalIgnoreCase);
@@ -381,7 +390,7 @@ public static partial class SourceResolver
     /// Lists <c>*.dll</c>/<c>*.exe</c> files in a single directory-listing pass per folder while caching companion
     /// <c>*.xml</c> metadata for that folder and its existing locale subfolders.
     /// </summary>
-    private static IEnumerable<FileInfo> EnumerateBinariesSafe(string root, bool recursive, DirectoryXmlCache xmlCache)
+    private static IEnumerable<FileInfo> EnumerateBinariesSafe(string root, bool recursive, DirectoryXmlCache? xmlCache)
     {
         var fileNameComparer = OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
         var stack = new Stack<DirectoryInfo>();
@@ -394,7 +403,7 @@ public static partial class SourceResolver
             catch { continue; }
 
             var binaries = new List<FileInfo>();
-            var rootXmls = new Dictionary<string, XmlFileMeta>(fileNameComparer);
+            var rootXmls = xmlCache != null ? new Dictionary<string, XmlFileMeta>(fileNameComparer) : null;
             Dictionary<string, DirectoryInfo>? existingLocaleDirs = null;
             List<DirectoryInfo>? childDirs = recursive ? new List<DirectoryInfo>() : null;
 
@@ -407,14 +416,14 @@ public static partial class SourceResolver
                     {
                         binaries.Add(fi);
                     }
-                    else if (fi.Name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                    else if (rootXmls != null && fi.Name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
                     {
                         rootXmls.TryAdd(fi.Name, new XmlFileMeta(fi.FullName, fi.Length, fi.LastWriteTimeUtc.Ticks));
                     }
                 }
                 else if (entry is DirectoryInfo sub)
                 {
-                    if (DirectoryXmlCache.IsLocaleXmlDir(sub.Name))
+                    if (xmlCache != null && DirectoryXmlCache.IsLocaleXmlDir(sub.Name))
                         (existingLocaleDirs ??= new Dictionary<string, DirectoryInfo>(fileNameComparer))[sub.Name] = sub;
 
                     if (childDirs != null && !IsLikelyLocaleDir(sub.Name))
@@ -422,7 +431,8 @@ public static partial class SourceResolver
                 }
             }
 
-            xmlCache.RecordDirectory(dir.FullName, rootXmls, existingLocaleDirs);
+            if (xmlCache != null && rootXmls != null)
+                xmlCache.RecordDirectory(dir.FullName, rootXmls, existingLocaleDirs);
 
             if (childDirs != null)
             {

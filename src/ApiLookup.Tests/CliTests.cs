@@ -126,7 +126,7 @@ public class CliTests : IDisposable
             Assert.False(doc.RootElement.GetProperty("dropped").GetBoolean());
         }
 
-        // 9. locate / scan zero-cache PE scan with --list-refs --json & --include-nonpublic (consistent camelCase!)
+        // 9. locate zero-cache PE scan with --list-refs --json & --include-nonpublic, rejecting --db / --index
         var locOut = new StringWriter();
         Assert.Equal(0, Program.Run(new[] { "locate", "InternalFixtureHelper", "--dll", _fixtureDll, "--include-nonpublic", "--list-refs", "--json" }, locOut, new StringWriter()));
         using (var doc = JsonDocument.Parse(locOut.ToString()))
@@ -138,8 +138,13 @@ public class CliTests : IDisposable
             Assert.Equal("ApiLookup.Tests.Fixtures.InternalFixtureHelper", matches[0].GetProperty("fullName").GetString());
         }
 
-        var scanTextOut = new StringWriter();
-        Assert.Equal(0, Program.Run(new[] { "scan", "SamplePipeSegment", "--db", dbPath }, scanTextOut, new StringWriter()));
-        Assert.Contains("[FOUND] ApiLookup.Tests.Fixtures.SamplePipeSegment", scanTextOut.ToString());
+        var locTextOut = new StringWriter();
+        Assert.Equal(0, Program.Run(new[] { "locate", "SamplePipeSegment", "--dll", _fixtureDll }, locTextOut, new StringWriter()));
+        Assert.Contains("[FOUND] ApiLookup.Tests.Fixtures.SamplePipeSegment", locTextOut.ToString());
+
+        var locDbErr = new StringWriter();
+        Assert.Equal(1, Program.Run(new[] { "locate", "SamplePipeSegment", "--db", dbPath }, new StringWriter(), locDbErr));
+        Assert.Contains("not valid for 'locate'", locDbErr.ToString());
+        Assert.Contains("'search' or 'show'", locDbErr.ToString());
     }
 }
