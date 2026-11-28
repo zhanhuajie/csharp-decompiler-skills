@@ -6,7 +6,13 @@ namespace ApiLookup;
 /// </summary>
 internal static class IndexSchema
 {
-    public const string Version = "4";
+    public const string Version = "5";
+
+    /// <summary>FTS rowid of a type entry (even numbers), so it can be updated in place after the bulk insert.</summary>
+    public static long FtsRowIdForType(long typeId) => typeId * 2;
+
+    /// <summary>FTS rowid of a member entry (odd numbers).</summary>
+    public static long FtsRowIdForMember(long memberId) => memberId * 2 + 1;
 
     /// <summary>Tables created before bulk insert (secondary indexes are added afterwards for speed).</summary>
     public const string CreateTablesSql = @"
@@ -41,6 +47,7 @@ CREATE TABLE types (
     base_type TEXT COLLATE NOCASE,
     base_bare TEXT COLLATE NOCASE,
     base_simple TEXT COLLATE NOCASE,
+    base_clr TEXT COLLATE NOCASE,
     interfaces TEXT NOT NULL,
     generic_params TEXT NOT NULL,
     generic_constraints TEXT NOT NULL,
@@ -48,13 +55,15 @@ CREATE TABLE types (
     is_extension_container INTEGER NOT NULL,
     summary TEXT,
     remarks TEXT,
-    doc_id TEXT NOT NULL
+    doc_id TEXT NOT NULL,
+    inheritdoc TEXT
 );
 
 CREATE TABLE type_interfaces (
     type_id INTEGER NOT NULL,
     iface_full TEXT NOT NULL COLLATE NOCASE,
-    iface_simple TEXT NOT NULL COLLATE NOCASE
+    iface_simple TEXT NOT NULL COLLATE NOCASE,
+    iface_clr TEXT NOT NULL COLLATE NOCASE
 );
 
 CREATE TABLE members (
@@ -75,7 +84,8 @@ CREATE TABLE members (
     summary TEXT,
     params_doc TEXT,
     returns_doc TEXT,
-    doc_id TEXT NOT NULL
+    doc_id TEXT NOT NULL,
+    inheritdoc TEXT
 );
 
 CREATE TABLE extension_targets (
@@ -92,6 +102,7 @@ CREATE TABLE member_type_refs (
 );
 
 -- 5 UNINDEXED filter columns followed by 4 searchable columns; bm25() weights in IndexStore.Search follow this order.
+-- rowid encodes the entity: types use id*2, members use id*2+1 (see IndexSchema.FtsRowId).
 CREATE VIRTUAL TABLE fts_entries USING fts5(
     entity_type UNINDEXED,
     entity_id UNINDEXED,
@@ -116,12 +127,14 @@ CREATE INDEX idx_types_name ON types(name);
 CREATE INDEX idx_types_base_type ON types(base_type);
 CREATE INDEX idx_types_base_bare ON types(base_bare);
 CREATE INDEX idx_types_base_simple ON types(base_simple);
+CREATE INDEX idx_types_base_clr ON types(base_clr);
 CREATE INDEX idx_types_namespace ON types(namespace);
 CREATE INDEX idx_types_assembly_id ON types(assembly_id);
 
 CREATE INDEX idx_type_interfaces_type_id ON type_interfaces(type_id);
 CREATE INDEX idx_type_interfaces_full ON type_interfaces(iface_full);
 CREATE INDEX idx_type_interfaces_simple ON type_interfaces(iface_simple);
+CREATE INDEX idx_type_interfaces_clr ON type_interfaces(iface_clr);
 
 CREATE INDEX idx_members_type_id ON members(type_id);
 CREATE INDEX idx_members_name ON members(name);

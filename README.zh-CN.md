@@ -8,7 +8,7 @@
 
 | 技能 | 描述 |
 | --- | --- |
-| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | 基于 `System.Reflection.Metadata` + SQLite FTS5 的离线 .NET API 索引与查询工具。支持全文与驼峰/中文分词搜索、干净的 C# 签名骨架（含可空注解、`ref`/`readonly` 结构体、继承成员、泛型约束扩展方法与 XML 注释）、类/接口继承树、按类型反查方法与类型转发定位。 |
+| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | 基于 `System.Reflection.Metadata` + SQLite FTS5 的离线 .NET API 索引与查询工具。支持全文与驼峰/中文分词搜索、干净的 C# 签名骨架（含各层级可空注解、`ref`/`readonly` 结构体、继承成员、泛型约束扩展方法与 XML 注释，并跨程序集解析 `<inheritdoc/>`）、按泛型元数精确匹配的类/接口继承树、按类型反查方法与类型转发定位。 |
 | [csharp-decompiler](csharp-decompiler/SKILL.md) | 使用 `ilspycmd` 将 .NET IL 程序集（`.dll`、`.exe`）反编译为 C# 源码。仅在需要查看方法体、内部副作用或导出完整项目时使用。 |
 
 ---

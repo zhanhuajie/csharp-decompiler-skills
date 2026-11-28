@@ -5,11 +5,16 @@ using System.Xml.Linq;
 
 namespace ApiLookup;
 
+/// <param name="InheritDocCref">
+/// <c>null</c> when the member has no <c>&lt;inheritdoc/&gt;</c>; empty string for <c>&lt;inheritdoc/&gt;</c> without
+/// <c>cref</c> (inherit from the overridden/implemented member); otherwise the <c>cref</c> doc ID to copy from.
+/// </param>
 public sealed record XmlDocEntry(
     string? Summary,
     string? Remarks,
     string? Returns,
-    IReadOnlyDictionary<string, string> Params);
+    IReadOnlyDictionary<string, string> Params,
+    string? InheritDocCref = null);
 
 public sealed class XmlDocBook
 {
@@ -110,10 +115,13 @@ public static partial class XmlDocReader
                         paramDict[pName] = pText;
                 }
 
-                if (summary == null && remarks == null && returns == null && valueDoc == null && paramDict.Count == 0)
+                var inheritDoc = m.Element("inheritdoc");
+                var inheritDocCref = inheritDoc == null ? null : (inheritDoc.Attribute("cref")?.Value?.Trim() ?? string.Empty);
+
+                if (summary == null && remarks == null && returns == null && valueDoc == null && paramDict.Count == 0 && inheritDocCref == null)
                     continue;
 
-                var entry = new XmlDocEntry(summary, remarks, returns, paramDict);
+                var entry = new XmlDocEntry(summary, remarks, returns, paramDict, inheritDocCref);
                 exact[name] = entry;
 
                 // Fallback key for methods with C++/CLI signature quirks: M:FullType.MethodName#paramCount.

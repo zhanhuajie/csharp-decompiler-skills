@@ -500,3 +500,51 @@ public sealed class XmlDocSignatureProvider : ISignatureTypeProvider<string, Gen
 
     public string GetFunctionPointerType(MethodSignature<string> signature) => "System.IntPtr";
 }
+
+/// <summary>
+/// Decodes type handles into CLR (reflection-style) names: namespace-qualified, <c>+</c> between nested types,
+/// generic arity suffixes kept, and generic instantiations collapsed to their definition
+/// (e.g. <c>System.Collections.Generic.List`1</c>). These match <c>types.clr_name</c> exactly, so base classes and
+/// interfaces can be resolved without confusing <c>Foo</c> with <c>Foo&lt;T&gt;</c>.
+/// </summary>
+internal sealed class ClrNameProvider : ISignatureTypeProvider<string, GenericContext>
+{
+    public static readonly ClrNameProvider Instance = new();
+
+    public string GetPrimitiveType(PrimitiveTypeCode typeCode) => XmlDocSignatureProvider.Instance.GetPrimitiveType(typeCode);
+
+    public string GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind)
+    {
+        var td = reader.GetTypeDefinition(handle);
+        var name = reader.GetString(td.Name);
+        if (td.IsNested)
+            return GetTypeFromDefinition(reader, td.GetDeclaringType(), 0) + "+" + name;
+        var ns = reader.GetString(td.Namespace);
+        return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+    }
+
+    public string GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind)
+    {
+        var tr = reader.GetTypeReference(handle);
+        var name = reader.GetString(tr.Name);
+        if (tr.ResolutionScope.Kind == HandleKind.TypeReference)
+            return GetTypeFromReference(reader, (TypeReferenceHandle)tr.ResolutionScope, 0) + "+" + name;
+        var ns = reader.GetString(tr.Namespace);
+        return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+    }
+
+    public string GetTypeFromSpecification(MetadataReader reader, GenericContext genericContext, TypeSpecificationHandle handle, byte rawTypeKind)
+        => reader.GetTypeSpecification(handle).DecodeSignature(this, genericContext);
+
+    public string GetGenericInstantiation(string genericType, ImmutableArray<string> typeArguments) => genericType;
+
+    public string GetSZArrayType(string elementType) => elementType + "[]";
+    public string GetArrayType(string elementType, ArrayShape shape) => $"{elementType}[{new string(',', Math.Max(0, shape.Rank - 1))}]";
+    public string GetByReferenceType(string elementType) => elementType + "&";
+    public string GetPointerType(string elementType) => elementType + "*";
+    public string GetPinnedType(string elementType) => elementType;
+    public string GetModifiedType(string modifier, string unmodifiedType, bool isRequired) => unmodifiedType;
+    public string GetGenericTypeParameter(GenericContext genericContext, int index) => "!" + index;
+    public string GetGenericMethodParameter(GenericContext genericContext, int index) => "!!" + index;
+    public string GetFunctionPointerType(MethodSignature<string> signature) => "System.IntPtr";
+}

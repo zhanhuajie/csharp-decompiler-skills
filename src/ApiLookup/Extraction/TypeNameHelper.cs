@@ -147,6 +147,18 @@ internal static class TypeNameHelper
         };
     }
 
+    /// <summary>Exact CLR name of the type definition behind a TypeDef/TypeRef/TypeSpec handle (see <see cref="ClrNameProvider"/>).</summary>
+    public static string ResolveEntityClrName(MetadataReader md, EntityHandle handle, GenericContext ctx)
+    {
+        return handle.Kind switch
+        {
+            HandleKind.TypeDefinition => ClrNameProvider.Instance.GetTypeFromDefinition(md, (TypeDefinitionHandle)handle, 0),
+            HandleKind.TypeReference => ClrNameProvider.Instance.GetTypeFromReference(md, (TypeReferenceHandle)handle, 0),
+            HandleKind.TypeSpecification => ClrNameProvider.Instance.GetTypeFromSpecification(md, ctx, (TypeSpecificationHandle)handle, 0),
+            _ => string.Empty,
+        };
+    }
+
     private static string StripDelimited(string text, char open, char close)
     {
         if (string.IsNullOrEmpty(text) || !text.Contains(open))

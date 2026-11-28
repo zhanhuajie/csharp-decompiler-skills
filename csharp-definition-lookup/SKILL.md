@@ -5,7 +5,7 @@ description: Fast offline .NET API metadata & XML-doc lookup powered by System.R
 
 # C# Definition & API Lookup
 
-Offline .NET metadata & XML documentation indexer (`System.Reflection.Metadata` + SQLite FTS5). Extracts clean C# signatures (including nullable annotations, `ref`/`readonly` structs, `ref` returns, `[Flags]` & `decimal` constants), class/interface inheritance chains, extension methods (including constrained generic extensions), enum values, type forwarders, and companion `.xml` docs directly from PE assemblies—without loading them into a host process or decompiling noisy IL.
+Offline .NET metadata & XML documentation indexer (`System.Reflection.Metadata` + SQLite FTS5). Extracts clean C# signatures (including full nullable annotations at every position such as `Dictionary<string, object?>?` and `string?[]`, `ref`/`readonly` structs, `ref` returns, `[Flags]` & `decimal` constants), class/interface inheritance chains (resolved by exact generic arity, so `Foo` and `Foo<T>` never mix), extension methods (including constrained generic extensions), enum values, type forwarders, and companion `.xml` docs (with `<inheritdoc/>` resolved across indexed assemblies) directly from PE assemblies—without loading them into a host process or decompiling noisy IL.
 
 ## Tool Location
 
@@ -33,7 +33,7 @@ No `dotnet-script` required.
 Every command accepts any combination of `--dir`, `--project`, `--dll`, or a previously built `--index <name>`:
 
 - `--dir <path>` (repeatable): Recursively scan managed `.dll` and `.exe` assemblies (automatically skips native-only binaries, `*.resources.dll`, and locale folders). Pair with `--include <glob>` / `--exclude <glob>` (e.g. `--exclude "DevExpress.*"`) to keep large SDK directories small and fast.
-- `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first), project references (honoring custom `<AssemblyName>`), plus `<HintPath>` references (expanding `$(ProjectDir)`, `$(SolutionDir)`, and MSBuild properties from `.csproj` / ancestor `Directory.Build.props`). For multi-TFM projects, automatically selects the highest framework or pass `--tfm <tfm>` (e.g. `--tfm net8.0`).
+- `--project <path.csproj>` (repeatable): Resolves NuGet packages via `obj/project.assets.json` (run `dotnet restore` first; package roots come from its `packageFolders`, so custom `globalPackagesFolder` / fallback folders work), project references (honoring custom `<AssemblyName>`), plus `<HintPath>` references (expanding `$(ProjectDir)`, `$(SolutionDir)`, and MSBuild properties from `.csproj` / ancestor `Directory.Build.props`). For multi-TFM projects, automatically selects the highest framework or pass `--tfm <tfm>` (e.g. `--tfm net8.0`).
 - `--dll <path.dll>` (repeatable): Index specific assembly files directly.
 - `--index <name>` (alias `--name`): Build once with `index --name <name> ...`, then reuse instantly (`<50 ms`) across queries.
 - Ad-hoc `--dir`/`--project`/`--dll` queries are **auto-cached** by file size + mtime fingerprint in `%LOCALAPPDATA%\csharp-api-lookup\indexes\` (or `~/.cache/csharp-api-lookup/indexes/`, overridable via `APILOOKUP_CACHE_DIR`). Run `apilookup.exe index --prune` to clean up old `auto-*.db` files and leftover temp files from interrupted builds.

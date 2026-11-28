@@ -13,7 +13,7 @@ SELECT t.id AS t_id, a.name AS t_asm_name, a.path AS t_asm_path, a.xml_path AS t
        t.full_name AS t_full_name, t.bare_full_name AS t_bare_full_name, t.clr_name AS t_clr_name,
        t.namespace AS t_namespace, t.name AS t_name, t.simple_name AS t_simple_name, t.kind AS t_kind,
        t.accessibility AS t_accessibility, t.modifiers AS t_modifiers, t.base_type AS t_base_type,
-       t.base_simple AS t_base_simple, t.interfaces AS t_interfaces, t.generic_params AS t_generic_params,
+       t.base_simple AS t_base_simple, t.base_clr AS t_base_clr, t.interfaces AS t_interfaces, t.generic_params AS t_generic_params,
        t.generic_constraints AS t_generic_constraints, t.delegate_signature AS t_delegate_signature,
        t.summary AS t_summary, t.remarks AS t_remarks";
 
@@ -25,7 +25,7 @@ JOIN assemblies a ON a.id = t.assembly_id";
     public const string Select = Columns + From;
 
     private readonly int _id, _asmName, _asmPath, _xmlPath, _fullName, _bareFullName, _clrName, _namespace, _name,
-        _simpleName, _kind, _accessibility, _modifiers, _baseType, _baseSimple, _interfaces, _genericParams,
+        _simpleName, _kind, _accessibility, _modifiers, _baseType, _baseSimple, _baseClr, _interfaces, _genericParams,
         _genericConstraints, _delegateSignature, _summary, _remarks;
 
     public TypeRowReader(SqliteDataReader r)
@@ -45,6 +45,7 @@ JOIN assemblies a ON a.id = t.assembly_id";
         _modifiers = r.GetOrdinal("t_modifiers");
         _baseType = r.GetOrdinal("t_base_type");
         _baseSimple = r.GetOrdinal("t_base_simple");
+        _baseClr = r.GetOrdinal("t_base_clr");
         _interfaces = r.GetOrdinal("t_interfaces");
         _genericParams = r.GetOrdinal("t_generic_params");
         _genericConstraints = r.GetOrdinal("t_generic_constraints");
@@ -69,6 +70,7 @@ JOIN assemblies a ON a.id = t.assembly_id";
         Modifiers: r.GetString(_modifiers),
         BaseType: r.GetNullableString(_baseType),
         BaseSimple: r.GetNullableString(_baseSimple),
+        BaseClrName: r.GetNullableString(_baseClr),
         Interfaces: r.GetString(_interfaces),
         GenericParams: r.GetString(_genericParams),
         GenericConstraints: r.GetString(_genericConstraints),

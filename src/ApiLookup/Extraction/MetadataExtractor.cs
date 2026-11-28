@@ -12,7 +12,6 @@ public static class MetadataExtractor
         MetadataReader Md,
         XmlDocBook XmlDocs,
         EnumLookup Enums,
-        ReferenceTypeLookup RefTypes,
         bool IncludeNonPublic);
 
     /// <summary>State shared by every member extracted from one type.</summary>
@@ -74,8 +73,8 @@ public static class MetadataExtractor
             var asmName = md.GetString(asmDef.Name);
             var asmVersion = asmDef.Version.ToString();
             var xmlDocs = XmlDocReader.Load(xmlPath, warnings);
-            var (enumLookup, refLookup) = ConstantAndAttributeReader.ScanAssemblyTypes(md, includeNonPublic);
-            var asm = new AssemblyContext(md, xmlDocs, enumLookup, refLookup, includeNonPublic);
+            var enumLookup = ConstantAndAttributeReader.ScanAssemblyTypes(md, includeNonPublic);
+            var asm = new AssemblyContext(md, xmlDocs, enumLookup, includeNonPublic);
 
             var types = new List<ExtractedType>();
             foreach (var handle in md.TypeDefinitions)
@@ -142,7 +141,7 @@ public static class MetadataExtractor
         var valueGenericParams = TypeNameHelper.ReadValueTypeGenericParams(md, td.GetGenericParameters());
         var genericCtx = new GenericContext(genericParamNames, Array.Empty<string>(), valueGenericParams);
 
-        var (baseFull, baseBare, baseSimple) = ResolveBaseType(md, td, genericCtx);
+        var (baseFull, baseBare, baseSimple, baseClr) = ResolveBaseType(md, td, genericCtx);
         var kind = DetermineTypeKind(td, baseFull);
         var visibility = GetEffectiveVisibility(md, td);
         var modifiers = DetermineTypeModifiers(md, td, kind);
@@ -182,6 +181,7 @@ public static class MetadataExtractor
             BaseType: baseFull,
             BaseBare: baseBare,
             BaseSimple: baseSimple,
+            BaseClr: baseClr,
             Interfaces: string.Join(", ", interfaces),
             InterfaceRefs: interfaceRefs,
             GenericParams: string.Join(", ", genericParamNames),
@@ -191,6 +191,7 @@ public static class MetadataExtractor
             Summary: typeDoc?.Summary,
             Remarks: typeDoc?.Remarks,
             DocId: docId,
+            InheritDoc: InheritDocOf(typeDoc),
             Members: ExtractMembers(typeCtx, td));
     }
 
@@ -256,14 +257,14 @@ public static class MetadataExtractor
             var method = md.GetMethodDefinition(mh);
             if (md.GetString(method.Name) != "Invoke") continue;
 
-            MethodSignature<string> sig;
-            try { sig = method.DecodeSignature(DisplaySignatureProvider.Instance, t.GenericCtx); }
+            MethodSignature<TypeSig> sig;
+            try { sig = method.DecodeSignature(TypeSigProvider.Instance, t.GenericCtx); }
             catch { return null; }
 
             var methodNullCtx = ConstantAndAttributeReader.ReadNullableContext(md, method.GetCustomAttributes()) ?? t.NullableContext;
             var (retInfo, paramInfos) = ReadParamMetadata(md, method);
 
-            var retRaw = ConstantAndAttributeReader.ApplyTopLevelNullability(sig.ReturnType, retInfo?.NullFlag, methodNullCtx, t.Asm.RefTypes, t.GenericCtx);
+            var retRaw = TypeSigRenderer.Render(sig.ReturnType, EffectiveFlags(retInfo?.NullFlags, methodNullCtx));
             var retText = FormatReturnRefPrefix(retRaw, retInfo);
 
             var sb = new StringBuilder();
@@ -277,15 +278,19 @@ public static class MetadataExtractor
         return null;
     }
 
-    private static (string? full, string? bare, string? simple) ResolveBaseType(MetadataReader md, TypeDefinition td, GenericContext ctx)
+    private static (string? full, string? bare, string? simple, string? clr) ResolveBaseType(MetadataReader md, TypeDefinition td, GenericContext ctx)
     {
-        if (td.BaseType.IsNil) return (null, null, null);
+        if (td.BaseType.IsNil) return (null, null, null, null);
         var full = TypeNameHelper.ResolveEntityFullName(md, td.BaseType, ctx);
-        if (string.IsNullOrEmpty(full)) return (null, null, null);
+        if (string.IsNullOrEmpty(full)) return (null, null, null, null);
         var bare = TypeNameHelper.StripGenerics(full);
         var simple = TypeNameHelper.ExtractSimpleTypeName(bare);
-        return (full, bare, simple);
+        var clr = TypeNameHelper.ResolveEntityClrName(md, td.BaseType, ctx);
+        return (full, bare, simple, string.IsNullOrEmpty(clr) ? null : clr);
     }
+
+    /// <summary>Records an unresolved <c>&lt;inheritdoc/&gt;</c> only when the entry has no summary of its own.</summary>
+    private static string? InheritDocOf(XmlDocEntry? doc) => doc?.Summary == null ? doc?.InheritDocCref : null;
 
     private static (List<string> DisplayNames, List<InterfaceRef> Refs) ResolveInterfaces(
         MetadataReader md,
@@ -309,7 +314,7 @@ public static class MetadataExtractor
                 var bare = TypeNameHelper.StripGenerics(full);
                 var simple = TypeNameHelper.ExtractSimpleTypeName(bare);
                 if (!string.IsNullOrEmpty(bare) && seenRefs.Add(bare))
-                    refs.Add(new InterfaceRef(bare, simple));
+                    refs.Add(new InterfaceRef(bare, simple, TypeNameHelper.ResolveEntityClrName(md, impl.Interface, ctx)));
             }
         }
         return (displayNames, refs);
@@ -411,11 +416,11 @@ public static class MetadataExtractor
         var modifiers = primaryMethod.HasValue ? GetMethodModifiers(primaryMethod.Value.Attributes, t.IsInterface) : string.Empty;
         var ctx = t.GenericCtx;
 
-        MethodSignature<string> dispSig;
+        MethodSignature<TypeSig> dispSig;
         MethodSignature<IReadOnlyList<(string FullName, string SimpleName)>> refSig;
         try
         {
-            dispSig = prop.DecodeSignature(DisplaySignatureProvider.Instance, ctx);
+            dispSig = prop.DecodeSignature(TypeSigProvider.Instance, ctx);
             refSig = prop.DecodeSignature(TypeRefCollectorProvider.Instance, ctx);
         }
         catch
@@ -435,10 +440,10 @@ public static class MetadataExtractor
             : (null, new Dictionary<int, ParamInfo>());
 
         var propNullCtx = (primaryMethod.HasValue ? ConstantAndAttributeReader.ReadNullableContext(md, primaryMethod.Value.GetCustomAttributes()) : null) ?? t.NullableContext;
-        var propNullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, prop.GetCustomAttributes()) ?? retInfo?.NullFlag;
-        var rawRet = ConstantAndAttributeReader.ApplyTopLevelNullability(dispSig.ReturnType, propNullFlag, propNullCtx, t.Asm.RefTypes, ctx);
+        var propNullFlags = ConstantAndAttributeReader.ReadNullableFlags(md, prop.GetCustomAttributes()) ?? retInfo?.NullFlags;
+        var rawRet = TypeSigRenderer.Render(dispSig.ReturnType, EffectiveFlags(propNullFlags, propNullCtx));
         var returnType = FormatReturnRefPrefix(rawRet, retInfo);
-        var returnSimple = TypeNameHelper.ExtractSimpleTypeName(dispSig.ReturnType);
+        var returnSimple = TypeNameHelper.ExtractSimpleTypeName(TypeSigRenderer.Render(dispSig.ReturnType));
 
         var isInit = setter.HasValue && IsInitOnlySetter(setter.Value);
         var accessorText = BuildPropertyAccessors(getterAcc, setterAcc, bestAcc, isInit);
@@ -494,7 +499,8 @@ public static class MetadataExtractor
             Summary: doc?.Summary,
             ParamsDoc: FormatParamsDoc(doc),
             ReturnsDoc: doc?.Returns,
-            DocId: docId);
+            DocId: docId,
+            InheritDoc: InheritDocOf(doc));
     }
 
     private static ExtractedMember? ExtractEvent(TypeContext t, EventDefinition ev, EventAccessors accessors)
@@ -512,10 +518,11 @@ public static class MetadataExtractor
         var name = md.GetString(ev.Name);
         var primary = adder ?? remover;
         var modifiers = primary.HasValue ? GetMethodModifiers(primary.Value.Attributes, t.IsInterface) : string.Empty;
-        var rawHandler = ev.Type.IsNil ? "EventHandler" : TypeNameHelper.ResolveEntityDisplayName(md, ev.Type, t.GenericCtx);
-        var evNullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, ev.GetCustomAttributes());
-        var handlerType = ConstantAndAttributeReader.ApplyTopLevelNullability(rawHandler, evNullFlag, t.NullableContext, t.Asm.RefTypes, t.GenericCtx);
-        var handlerSimple = TypeNameHelper.ExtractSimpleTypeName(rawHandler);
+        var handlerSig = (ev.Type.IsNil ? null : TypeSigProvider.FromEntity(md, ev.Type, t.GenericCtx))
+                         ?? new NamedTypeSig("EventHandler", "System.EventHandler", IsValueType: false);
+        var evNullFlags = ConstantAndAttributeReader.ReadNullableFlags(md, ev.GetCustomAttributes());
+        var handlerType = TypeSigRenderer.Render(handlerSig, EffectiveFlags(evNullFlags, t.NullableContext));
+        var handlerSimple = TypeNameHelper.ExtractSimpleTypeName(TypeSigRenderer.Render(handlerSig));
 
         var sb = new StringBuilder();
         sb.Append(acc).Append(' ');
@@ -549,7 +556,8 @@ public static class MetadataExtractor
             Summary: doc?.Summary,
             ParamsDoc: null,
             ReturnsDoc: null,
-            DocId: docId);
+            DocId: docId,
+            InheritDoc: InheritDocOf(doc));
     }
 
     private static ExtractedMember? ExtractField(TypeContext t, FieldDefinition field)
@@ -562,11 +570,11 @@ public static class MetadataExtractor
         if (!t.Asm.IncludeNonPublic && !Accessibilities.IsPublicApi(acc))
             return null;
 
-        string rawFieldType;
+        TypeSig fieldSig;
         IReadOnlyList<(string FullName, string SimpleName)> collectedRefs;
         try
         {
-            rawFieldType = field.DecodeSignature(DisplaySignatureProvider.Instance, t.GenericCtx);
+            fieldSig = field.DecodeSignature(TypeSigProvider.Instance, t.GenericCtx);
             collectedRefs = field.DecodeSignature(TypeRefCollectorProvider.Instance, t.GenericCtx);
         }
         catch
@@ -575,8 +583,8 @@ public static class MetadataExtractor
         }
 
         var fieldAttrs = field.GetCustomAttributes();
-        var fieldNullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, fieldAttrs);
-        var fieldType = ConstantAndAttributeReader.ApplyTopLevelNullability(rawFieldType, fieldNullFlag, t.NullableContext, t.Asm.RefTypes, t.GenericCtx);
+        var rawFieldType = TypeSigRenderer.Render(fieldSig);
+        var fieldType = TypeSigRenderer.Render(fieldSig, EffectiveFlags(ConstantAndAttributeReader.ReadNullableFlags(md, fieldAttrs), t.NullableContext));
 
         var isLiteral = (field.Attributes & FieldAttributes.Literal) != 0;
         var isStatic = (field.Attributes & FieldAttributes.Static) != 0;
@@ -620,7 +628,8 @@ public static class MetadataExtractor
                 Summary: doc?.Summary,
                 ParamsDoc: null,
                 ReturnsDoc: null,
-                DocId: docId);
+                DocId: docId,
+            InheritDoc: InheritDocOf(doc));
         }
 
         var mods = new List<string>();
@@ -655,7 +664,8 @@ public static class MetadataExtractor
             Summary: doc?.Summary,
             ParamsDoc: null,
             ReturnsDoc: null,
-            DocId: docId);
+            DocId: docId,
+            InheritDoc: InheritDocOf(doc));
     }
 
     private static ExtractedMember? ExtractMethod(TypeContext t, MethodDefinition method)
@@ -682,11 +692,11 @@ public static class MetadataExtractor
             }
             : t.GenericCtx;
 
-        MethodSignature<string> dispSig;
+        MethodSignature<TypeSig> dispSig;
         MethodSignature<IReadOnlyList<(string FullName, string SimpleName)>> refSig;
         try
         {
-            dispSig = method.DecodeSignature(DisplaySignatureProvider.Instance, fullCtx);
+            dispSig = method.DecodeSignature(TypeSigProvider.Instance, fullCtx);
             refSig = method.DecodeSignature(TypeRefCollectorProvider.Instance, fullCtx);
         }
         catch
@@ -714,7 +724,7 @@ public static class MetadataExtractor
         var returnType = isCtor
             ? t.SimpleName
             : FormatReturnRefPrefix(
-                ConstantAndAttributeReader.ApplyTopLevelNullability(dispSig.ReturnType, retInfo?.NullFlag, methodNullCtx, t.Asm.RefTypes, fullCtx),
+                TypeSigRenderer.Render(dispSig.ReturnType, EffectiveFlags(retInfo?.NullFlags, methodNullCtx)),
                 retInfo);
 
         var sb = new StringBuilder();
@@ -771,7 +781,7 @@ public static class MetadataExtractor
             Accessibility: acc,
             Modifiers: modifiers,
             ReturnType: returnType,
-            ReturnSimple: isCtor ? t.SimpleName : TypeNameHelper.ExtractSimpleTypeName(dispSig.ReturnType),
+            ReturnSimple: isCtor ? t.SimpleName : TypeNameHelper.ExtractSimpleTypeName(TypeSigRenderer.Render(dispSig.ReturnType)),
             Signature: sb.ToString(),
             ParamTypes: string.Join("|", paramSimpleList),
             TypeRefs: typeRefs.Items,
@@ -782,7 +792,8 @@ public static class MetadataExtractor
             Summary: doc?.Summary,
             ParamsDoc: FormatParamsDoc(doc),
             ReturnsDoc: doc?.Returns,
-            DocId: docId);
+            DocId: docId,
+            InheritDoc: InheritDocOf(doc));
     }
 
     private static string? JoinExtensionTargets(IReadOnlyList<ExtensionTargetRef> targets, Func<ExtensionTargetRef, string> selector)
@@ -803,7 +814,7 @@ public static class MetadataExtractor
     private static void AppendParameters(
         StringBuilder sb,
         AssemblyContext asm,
-        IReadOnlyList<string> parameterTypes,
+        IReadOnlyList<TypeSig> parameterTypes,
         Dictionary<int, ParamInfo> paramInfos,
         byte nullableContext,
         GenericContext ctx,
@@ -814,7 +825,7 @@ public static class MetadataExtractor
         {
             if (i > 0) sb.Append(", ");
             paramInfos.TryGetValue(i + 1, out var pi);
-            var rawPt = ConstantAndAttributeReader.ApplyTopLevelNullability(parameterTypes[i], pi?.NullFlag, nullableContext, asm.RefTypes, ctx);
+            var rawPt = TypeSigRenderer.Render(parameterTypes[i], EffectiveFlags(pi?.NullFlags, nullableContext));
 
             if (i == 0 && isExtension) sb.Append("this ");
             if (pi?.IsParams == true) sb.Append("params ");
@@ -830,6 +841,10 @@ public static class MetadataExtractor
             }
         }
     }
+
+    /// <summary>Per-position <c>NullableAttribute</c> flags win; otherwise the enclosing nullable context applies uniformly.</summary>
+    private static NullableFlags EffectiveFlags(NullableFlags? attributeFlags, byte nullableContext)
+        => attributeFlags ?? NullableFlags.Uniform(nullableContext);
 
     private static string FormatReturnRefPrefix(string rawRet, ParamInfo? retInfo)
     {
@@ -857,7 +872,7 @@ public static class MetadataExtractor
         bool IsIn,
         bool IsReadOnly,
         bool IsParams,
-        byte? NullFlag,
+        NullableFlags? NullFlags,
         string? DefaultValue,
         bool IsIntegerConst);
 
@@ -870,7 +885,7 @@ public static class MetadataExtractor
         {
             var p = md.GetParameter(ph);
             var attrs = p.GetCustomAttributes();
-            var nullFlag = ConstantAndAttributeReader.ReadTopLevelNullableFlag(md, attrs);
+            var nullFlag = ConstantAndAttributeReader.ReadNullableFlags(md, attrs);
             var isReadOnly = ConstantAndAttributeReader.HasAttribute(md, attrs, "System.Runtime.CompilerServices", "IsReadOnlyAttribute")
                           || ConstantAndAttributeReader.HasAttribute(md, attrs, "System.Runtime.CompilerServices", "RequiresLocationAttribute");
 

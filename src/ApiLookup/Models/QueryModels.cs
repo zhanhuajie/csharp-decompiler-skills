@@ -66,6 +66,7 @@ public sealed record TypeRow(
     string Modifiers,
     string? BaseType,
     string? BaseSimple,
+    string? BaseClrName,
     string Interfaces,
     string GenericParams,
     string GenericConstraints,

@@ -288,6 +288,42 @@ public static partial class SourceResolver
 
     private sealed record PackageDllCandidate(string FullPath, string? XmlPath, bool IsRuntime);
 
+    /// <summary>
+    /// Package roots in restore priority order. <c>project.assets.json</c> records the exact folders NuGet restored into
+    /// (<c>globalPackagesFolder</c> from NuGet.config / <c>NUGET_PACKAGES</c>, plus fallback folders such as the SDK's
+    /// offline cache), so prefer them over guessing; fall back to the default global packages folder.
+    /// </summary>
+    internal static IReadOnlyList<string> GetPackageFolders(JsonElement assetsRoot)
+    {
+        var folders = new List<string>();
+        if (assetsRoot.TryGetProperty("packageFolders", out var pf) && pf.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var folder in pf.EnumerateObject())
+            {
+                if (!string.IsNullOrWhiteSpace(folder.Name))
+                    folders.Add(NormalizeSeparators(folder.Name));
+            }
+        }
+
+        var defaultRoot = GetNuGetCachePath();
+        if (!folders.Any(f => string.Equals(Path.TrimEndingDirectorySeparator(f), Path.TrimEndingDirectorySeparator(defaultRoot), StringComparison.OrdinalIgnoreCase)))
+            folders.Add(defaultRoot);
+        return folders;
+    }
+
+    /// <summary>First package root that actually contains <paramref name="relativePackagePath"/> (e.g. <c>newtonsoft.json/13.0.3</c>).</summary>
+    private static string ResolvePackageRoot(IReadOnlyList<string> packageRoots, string relativePackagePath)
+    {
+        var rel = NormalizeSeparators(relativePackagePath);
+        foreach (var root in packageRoots)
+        {
+            var candidate = Path.Combine(root, rel);
+            if (Directory.Exists(candidate))
+                return candidate;
+        }
+        return Path.Combine(packageRoots[0], rel);
+    }
+
     private static IEnumerable<(string dll, string group, string? xmlPath)> ResolveFromAssets(
         string assetsFile,
         string projectDir,
@@ -295,7 +331,6 @@ public static partial class SourceResolver
         List<string> warnings)
     {
         var output = new List<(string dll, string group, string? xmlPath)>();
-        var nugetCache = GetNuGetCachePath();
 
         try
         {
@@ -305,6 +340,8 @@ public static partial class SourceResolver
             if (!root.TryGetProperty("libraries", out var libraries) ||
                 !root.TryGetProperty("targets", out var targets))
                 return output;
+
+            var packageRoots = GetPackageFolders(root);
 
             var tfmEntries = targets.EnumerateObject().ToList();
             if (tfmEntries.Count == 0) return output;
@@ -360,7 +397,7 @@ public static partial class SourceResolver
 
                     var pkgPath = bp.GetString();
                     if (string.IsNullOrEmpty(pkgPath)) continue;
-                    var pkgRoot = Path.Combine(nugetCache, pkgPath);
+                    var pkgRoot = ResolvePackageRoot(packageRoots, pkgPath);
 
                     // Deduplicate compile (ref/) vs runtime (lib/) by DLL filename within the same package.
                     var byFileName = new Dictionary<string, PackageDllCandidate>(StringComparer.OrdinalIgnoreCase);

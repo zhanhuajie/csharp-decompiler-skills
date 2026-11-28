@@ -211,6 +211,22 @@ WHERE (t.bare_full_name LIKE $suffixDot ESCAPE '\'
             assemblyFilter);
     }
 
+    /// <summary>Exact lookup by CLR name (e.g. <c>Ns.Base`1</c>), which never confuses <c>Foo</c> with <c>Foo&lt;T&gt;</c>.</summary>
+    private List<TypeRow> ResolveTypeByClr(string clrName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = TypeRowReader.Select + " WHERE t.clr_name = $clr ORDER BY t.full_name ASC, a.name ASC LIMIT 50";
+        cmd.Parameters.AddWithValue("$clr", clrName);
+        return TypeRowReader.ReadAll(cmd);
+    }
+
+    /// <summary>
+    /// Resolves a declared base class or interface. When the CLR name is known it is authoritative (no fuzzy fallback
+    /// that could pick a different generic arity); name-based resolution is only used for rows without it.
+    /// </summary>
+    private IReadOnlyList<TypeRow> ResolveReferencedType(string? clrName, string fallbackName)
+        => !string.IsNullOrEmpty(clrName) ? ResolveTypeByClr(clrName) : ResolveType(fallbackName);
+
     private List<TypeRow> QueryTypes(
         string baseSql,
         Action<SqliteCommand> bindParams,
@@ -279,6 +295,7 @@ END, m.id ASC";
         var steps = new List<(string, TypeRow?)>();
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { target.BareFullName };
         var currentBase = target.BaseType;
+        var currentBaseClr = target.BaseClrName;
         var currentAsmPath = target.AssemblyPath;
 
         for (var i = 0; i < maxDepth && !string.IsNullOrEmpty(currentBase); i++)
@@ -293,7 +310,7 @@ END, m.id ASC";
                 break;
             }
 
-            var matches = ResolveType(bareBase);
+            var matches = ResolveReferencedType(currentBaseClr, bareBase);
             if (matches.Count == 0)
             {
                 steps.Add((currentBase, null));
@@ -303,6 +320,7 @@ END, m.id ASC";
             var baseRow = PickPreferredAssemblyMatch(matches, currentAsmPath);
             steps.Add((currentBase, baseRow));
             currentBase = baseRow.BaseType;
+            currentBaseClr = baseRow.BaseClrName;
             currentAsmPath = baseRow.AssemblyPath;
         }
         return steps;
@@ -320,12 +338,12 @@ END, m.id ASC";
             var (cur, depth) = queue.Dequeue();
             if (depth >= maxDepth) continue;
 
-            foreach (var (ifaceFull, ifaceSimple) in LoadInterfacesForTypes(new List<long> { cur.Id }))
+            foreach (var (ifaceFull, ifaceSimple, ifaceClr) in LoadInterfacesForTypes(new List<long> { cur.Id }))
             {
                 var query = !string.IsNullOrEmpty(ifaceFull) ? ifaceFull : ifaceSimple;
-                if (string.IsNullOrEmpty(query)) continue;
+                if (string.IsNullOrEmpty(query) && string.IsNullOrEmpty(ifaceClr)) continue;
 
-                var matches = ResolveType(query);
+                var matches = ResolveReferencedType(ifaceClr, query);
                 if (matches.Count == 0) continue;
 
                 var parentRow = PickPreferredAssemblyMatch(matches, cur.AssemblyPath);
@@ -398,7 +416,7 @@ END, m.id ASC";
         var typeIds = new List<long>(1 + baseChain.Count) { target.Id };
         foreach (var b in baseChain) typeIds.Add(b.Id);
 
-        foreach (var (ifaceFull, ifaceSimple) in LoadInterfacesForTypes(typeIds))
+        foreach (var (ifaceFull, ifaceSimple, _) in LoadInterfacesForTypes(typeIds))
         {
             satisfiedFulls.Add(ifaceFull);
             if (!string.IsNullOrEmpty(ifaceSimple))
@@ -493,31 +511,24 @@ WHERE et.target_simple IN ({simpleParams})";
 
         var derived = new List<TypeRow>();
         var seenDerived = new HashSet<long> { target.Id };
-        var queue = new Queue<(string BareFull, string Simple, string Kind)>();
-        queue.Enqueue((target.BareFullName, target.SimpleName, target.Kind));
+        var queue = new Queue<(string ClrName, string Kind)>();
+        queue.Enqueue((target.ClrName, target.Kind));
 
         while (queue.Count > 0 && derived.Count < limit)
         {
-            var (curFull, curSimple, curKind) = queue.Dequeue();
+            var (curClr, curKind) = queue.Dequeue();
             using var cmd = _conn.CreateCommand();
 
-            if (TypeKinds.IsInterface(curKind))
-            {
-                var useFull = curFull.Contains('.');
-                cmd.CommandText = TypeRowReader.Select + @"
+            // Exact CLR-name joins: implementers/subclasses of Foo<T> are never mixed up with those of Foo.
+            cmd.CommandText = TypeKinds.IsInterface(curKind)
+                ? TypeRowReader.Select + @"
 JOIN type_interfaces ti ON ti.type_id = t.id
-WHERE " + (useFull ? "ti.iface_full = $full" : "ti.iface_simple = $simple") + @"
+WHERE ti.iface_clr = $clr
+ORDER BY t.full_name ASC LIMIT $rem"
+                : TypeRowReader.Select + @"
+WHERE t.base_clr = $clr
 ORDER BY t.full_name ASC LIMIT $rem";
-                if (useFull) cmd.Parameters.AddWithValue("$full", curFull);
-                else cmd.Parameters.AddWithValue("$simple", curSimple);
-            }
-            else
-            {
-                cmd.CommandText = TypeRowReader.Select + @"
-WHERE t.base_bare = $full
-ORDER BY t.full_name ASC LIMIT $rem";
-                cmd.Parameters.AddWithValue("$full", curFull);
-            }
+            cmd.Parameters.AddWithValue("$clr", curClr);
             cmd.Parameters.AddWithValue("$rem", limit - derived.Count);
 
             foreach (var row in TypeRowReader.ReadAll(cmd))
@@ -526,7 +537,7 @@ ORDER BY t.full_name ASC LIMIT $rem";
                 if (seenDerived.Add(row.Id))
                 {
                     derived.Add(row);
-                    queue.Enqueue((row.BareFullName, row.SimpleName, row.Kind));
+                    queue.Enqueue((row.ClrName, row.Kind));
                 }
             }
         }
@@ -674,16 +685,16 @@ LIMIT $limit";
         return map;
     }
 
-    private List<(string FullName, string SimpleName)> LoadInterfacesForTypes(List<long> typeIds)
+    private List<(string FullName, string SimpleName, string ClrName)> LoadInterfacesForTypes(List<long> typeIds)
     {
-        var list = new List<(string, string)>();
+        var list = new List<(string, string, string)>();
         foreach (var chunk in typeIds.Chunk(500))
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = $"SELECT DISTINCT iface_full, iface_simple FROM type_interfaces WHERE type_id IN ({AddInParameters(cmd, "$tid", chunk)})";
+            cmd.CommandText = $"SELECT DISTINCT iface_full, iface_simple, iface_clr FROM type_interfaces WHERE type_id IN ({AddInParameters(cmd, "$tid", chunk)})";
             using var r = cmd.ExecuteReader();
             while (r.Read())
-                list.Add((r.GetString(0), r.GetString(1)));
+                list.Add((r.GetString(0), r.GetString(1), r.GetString(2)));
         }
         return list;
     }

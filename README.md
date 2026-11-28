@@ -8,7 +8,7 @@ A collection of agent-agnostic AI skills for .NET API metadata indexing, symbol/
 
 | Skill | Description |
 | --- | --- |
-| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | Offline .NET API indexer (`System.Reflection.Metadata` + SQLite FTS5). Full-text, CamelCase & CJK search across types, members, and XML docs; clean C# API skeletons (nullable annotations, `ref`/`readonly` structs, inherited class/interface members & constrained generic extensions); type hierarchy, reverse type lookup, and `[TypeForwardedTo]` locator. |
+| [csharp-definition-lookup](csharp-definition-lookup/SKILL.md) | Offline .NET API indexer (`System.Reflection.Metadata` + SQLite FTS5). Full-text, CamelCase & CJK search across types, members, and XML docs; clean C# API skeletons (full nullable annotations, `ref`/`readonly` structs, inherited class/interface members & constrained generic extensions, `<inheritdoc/>` resolution); arity-exact type hierarchy, reverse type lookup, and `[TypeForwardedTo]` locator. |
 | [csharp-decompiler](csharp-decompiler/SKILL.md) | Decompile .NET IL assemblies (`.dll`, `.exe`) to C# source code via `ilspycmd`. Use when method bodies, internal side effects, or full project export are needed. |
 
 ---

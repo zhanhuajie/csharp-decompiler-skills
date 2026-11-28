@@ -94,6 +94,7 @@ PRAGMA cache_size = -64000;
                 }
 
                 CreateIndexes(conn);
+                InheritDocResolver.Resolve(conn);
                 ExecuteNonQuery(conn, @"
 INSERT INTO fts_entries(fts_entries) VALUES('optimize');
 ANALYZE;
@@ -231,11 +232,11 @@ VALUES($id, $name, $path, $version, $xml, $size, $mtime, $tcount);";
         typeCmd.Transaction = tx;
         typeCmd.CommandText = @"
 INSERT INTO types(id, assembly_id, full_name, bare_full_name, clr_name, namespace, name, simple_name, kind,
-                  accessibility, modifiers, base_type, base_bare, base_simple, interfaces, generic_params,
-                  generic_constraints, delegate_signature, is_extension_container, summary, remarks, doc_id)
+                  accessibility, modifiers, base_type, base_bare, base_simple, base_clr, interfaces, generic_params,
+                  generic_constraints, delegate_signature, is_extension_container, summary, remarks, doc_id, inheritdoc)
 VALUES($id, $aid, $full, $bareFull, $clr, $ns, $name, $simple, $kind,
-       $acc, $mod, $base, $baseBare, $baseSimple, $ifaces, $gp,
-       $gcon, $dsig, $ext, $sum, $rem, $docId);";
+       $acc, $mod, $base, $baseBare, $baseSimple, $baseClr, $ifaces, $gp,
+       $gcon, $dsig, $ext, $sum, $rem, $docId, $inh);";
         var pTId = typeCmd.Parameters.Add("$id", SqliteType.Integer);
         var pTAid = typeCmd.Parameters.Add("$aid", SqliteType.Integer);
         var pTFull = typeCmd.Parameters.Add("$full", SqliteType.Text);
@@ -258,21 +259,24 @@ VALUES($id, $aid, $full, $bareFull, $clr, $ns, $name, $simple, $kind,
         var pTSum = typeCmd.Parameters.Add("$sum", SqliteType.Text);
         var pTRem = typeCmd.Parameters.Add("$rem", SqliteType.Text);
         var pTDocId = typeCmd.Parameters.Add("$docId", SqliteType.Text);
+        var pTBaseClr = typeCmd.Parameters.Add("$baseClr", SqliteType.Text);
+        var pTInh = typeCmd.Parameters.Add("$inh", SqliteType.Text);
 
         using var ifaceCmd = conn.CreateCommand();
         ifaceCmd.Transaction = tx;
-        ifaceCmd.CommandText = "INSERT INTO type_interfaces(type_id, iface_full, iface_simple) VALUES($tid, $full, $simple);";
+        ifaceCmd.CommandText = "INSERT INTO type_interfaces(type_id, iface_full, iface_simple, iface_clr) VALUES($tid, $full, $simple, $clr);";
         var pITid = ifaceCmd.Parameters.Add("$tid", SqliteType.Integer);
         var pIFull = ifaceCmd.Parameters.Add("$full", SqliteType.Text);
         var pISimple = ifaceCmd.Parameters.Add("$simple", SqliteType.Text);
+        var pIClr = ifaceCmd.Parameters.Add("$clr", SqliteType.Text);
 
         using var memCmd = conn.CreateCommand();
         memCmd.Transaction = tx;
         memCmd.CommandText = @"
 INSERT INTO members(id, type_id, assembly_id, kind, name, accessibility, modifiers, return_type, return_simple,
-                    signature, param_types, ext_target_type, ext_target_simple, enum_value, summary, params_doc, returns_doc, doc_id)
+                    signature, param_types, ext_target_type, ext_target_simple, enum_value, summary, params_doc, returns_doc, doc_id, inheritdoc)
 VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
-       $sig, $ptypes, $extT, $extS, $eval, $sum, $pdoc, $rdoc, $docId);";
+       $sig, $ptypes, $extT, $extS, $eval, $sum, $pdoc, $rdoc, $docId, $inh);";
         var pMId = memCmd.Parameters.Add("$id", SqliteType.Integer);
         var pMTid = memCmd.Parameters.Add("$tid", SqliteType.Integer);
         var pMAid = memCmd.Parameters.Add("$aid", SqliteType.Integer);
@@ -291,6 +295,7 @@ VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
         var pMPdoc = memCmd.Parameters.Add("$pdoc", SqliteType.Text);
         var pMRdoc = memCmd.Parameters.Add("$rdoc", SqliteType.Text);
         var pMDocId = memCmd.Parameters.Add("$docId", SqliteType.Text);
+        var pMInh = memCmd.Parameters.Add("$inh", SqliteType.Text);
 
         using var extTargetCmd = conn.CreateCommand();
         extTargetCmd.Transaction = tx;
@@ -310,8 +315,9 @@ VALUES($id, $tid, $aid, $kind, $name, $acc, $mod, $ret, $retS,
         using var ftsCmd = conn.CreateCommand();
         ftsCmd.Transaction = tx;
         ftsCmd.CommandText = @"
-INSERT INTO fts_entries(entity_type, entity_id, kind, assembly_name, namespace, full_name, name, tokens, summary)
-VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
+INSERT INTO fts_entries(rowid, entity_type, entity_id, kind, assembly_name, namespace, full_name, name, tokens, summary)
+VALUES($rowid, $et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
+        var pFRowId = ftsCmd.Parameters.Add("$rowid", SqliteType.Integer);
         var pFEt = ftsCmd.Parameters.Add("$et", SqliteType.Text);
         var pFEid = ftsCmd.Parameters.Add("$eid", SqliteType.Integer);
         var pFKind = ftsCmd.Parameters.Add("$kind", SqliteType.Text);
@@ -366,6 +372,8 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                     pTSum.Value = (object?)t.Summary ?? DBNull.Value;
                     pTRem.Value = (object?)t.Remarks ?? DBNull.Value;
                     pTDocId.Value = t.DocId;
+                    pTBaseClr.Value = (object?)t.BaseClr ?? DBNull.Value;
+                    pTInh.Value = (object?)t.InheritDoc ?? DBNull.Value;
                     typeCmd.ExecuteNonQuery();
 
                     foreach (var iface in t.InterfaceRefs)
@@ -373,14 +381,11 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         pITid.Value = typeId;
                         pIFull.Value = iface.FullName;
                         pISimple.Value = iface.SimpleName;
+                        pIClr.Value = iface.ClrName;
                         ifaceCmd.ExecuteNonQuery();
                     }
 
-                    var tTokens = Tokenizer.BuildSearchTokens(t.SimpleName, t.FullName, t.BaseSimple, t.Interfaces);
-                    var tCjk = Tokenizer.BuildCjkSummaryTokens(t.Summary);
-                    if (tCjk.Length > 0)
-                        tTokens = string.IsNullOrEmpty(tTokens) ? tCjk : $"{tTokens} {tCjk}";
-
+                    pFRowId.Value = IndexSchema.FtsRowIdForType(typeId);
                     pFEt.Value = EntityTypes.Type;
                     pFEid.Value = typeId;
                     pFKind.Value = t.Kind;
@@ -388,7 +393,7 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                     pFNs.Value = t.Namespace;
                     pFFull.Value = t.FullName;
                     pFName.Value = t.SimpleName;
-                    pFTokens.Value = tTokens;
+                    pFTokens.Value = BuildTypeTokens(t.SimpleName, t.FullName, t.BaseSimple, t.Interfaces, t.Summary);
                     pFSum.Value = t.Summary ?? string.Empty;
                     ftsCmd.ExecuteNonQuery();
 
@@ -413,6 +418,7 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         pMPdoc.Value = (object?)m.ParamsDoc ?? DBNull.Value;
                         pMRdoc.Value = (object?)m.ReturnsDoc ?? DBNull.Value;
                         pMDocId.Value = m.DocId;
+                        pMInh.Value = (object?)m.InheritDoc ?? DBNull.Value;
                         memCmd.ExecuteNonQuery();
 
                         foreach (var et in m.ExtensionTargets)
@@ -436,11 +442,7 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         if (m.Kind == MemberKinds.Constructor && string.IsNullOrEmpty(m.ParamTypes))
                             continue;
 
-                        var mTokens = Tokenizer.BuildSearchTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes);
-                        var mCjk = Tokenizer.BuildCjkSummaryTokens(m.Summary);
-                        if (mCjk.Length > 0)
-                            mTokens = string.IsNullOrEmpty(mTokens) ? mCjk : $"{mTokens} {mCjk}";
-
+                        pFRowId.Value = IndexSchema.FtsRowIdForMember(memId);
                         pFEt.Value = EntityTypes.Member;
                         pFEid.Value = memId;
                         pFKind.Value = m.Kind;
@@ -448,13 +450,28 @@ VALUES($et, $eid, $kind, $aname, $ns, $full, $name, $tokens, $sum);";
                         pFNs.Value = t.Namespace;
                         pFFull.Value = $"{t.FullName}.{m.Name}";
                         pFName.Value = m.Name;
-                        pFTokens.Value = mTokens;
+                        pFTokens.Value = BuildMemberTokens(m.Name, t.SimpleName, m.ReturnSimple, m.ParamTypes, m.Summary);
                         pFSum.Value = m.Summary ?? string.Empty;
                         ftsCmd.ExecuteNonQuery();
                     }
                 }
             }
         }
+    }
+
+    /// <summary>FTS <c>tokens</c> column for a type: CamelCase-expanded names plus CJK n-grams of the summary.</summary>
+    internal static string BuildTypeTokens(string simpleName, string fullName, string? baseSimple, string interfaces, string? summary)
+        => AppendCjkTokens(Tokenizer.BuildSearchTokens(simpleName, fullName, baseSimple, interfaces), summary);
+
+    /// <summary>FTS <c>tokens</c> column for a member.</summary>
+    internal static string BuildMemberTokens(string name, string declaringSimpleName, string returnSimple, string paramTypes, string? summary)
+        => AppendCjkTokens(Tokenizer.BuildSearchTokens(name, declaringSimpleName, returnSimple, paramTypes), summary);
+
+    private static string AppendCjkTokens(string tokens, string? summary)
+    {
+        var cjk = Tokenizer.BuildCjkSummaryTokens(summary);
+        if (cjk.Length == 0) return tokens;
+        return string.IsNullOrEmpty(tokens) ? cjk : $"{tokens} {cjk}";
     }
 
     private static void ExecuteNonQuery(SqliteConnection conn, string sql)
