@@ -1,4 +1,4 @@
-# csharp-decompiler-skills
+# dotnet-inspect-skills
 
 [English](README.md)
 
